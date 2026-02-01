@@ -601,6 +601,12 @@ def run_scheduler(
                     break
                 continue
 
+            if _violates_no_empty_on_workday(daily_list, employee_cols, people_dict):
+                skip_streak += 1
+                if skip_streak >= max_skip_streak:
+                    break
+                continue
+
             # We have a valid roster attempt; reset skip streak.
             skip_streak = 0
 
@@ -640,6 +646,8 @@ def run_scheduler(
         _schedule_once()
         if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
             raise ValueError("[FINAL] Single run violated constraint: some A/B 拉班次數 is 0")
+        if _violates_no_empty_on_workday(daily_list, employee_cols, people_dict):
+            raise ValueError("[FINAL] Single run violated constraint: non-rest day has empty cell")
         best_pull_std = _pull_std_ab(people_dict)
         best_fair_std = _fairness_sum_std_ab(people_dict)
         best_score = best_pull_std + best_fair_std
@@ -861,6 +869,46 @@ def _validate_hard_rules_in11_out_early(daily_list: list[dict], people_dict: dic
                 continue
             if _violates_in11_out_early(emp, d, people_dict):
                 raise ValueError(f"[RULE] 入境11→隔天出境早班違規: {emp} on day {d}")
+
+
+def _has_assignment_on_day(dd: dict, emp: str) -> bool:
+    """True if emp is assigned to any shift on that day (by 原員工)."""
+    bd = dd.get("班段", {}) or {}
+    for _, recs in bd.items():
+        if not isinstance(recs, list):
+            continue
+        for r in recs:
+            if not isinstance(r, dict):
+                continue
+            who = str(r.get("原員工", r.get("人員", "")) or "").strip()
+            if who == emp:
+                return True
+    return False
+
+
+def _violates_no_empty_on_workday(
+    daily_list: list[dict],
+    employee_cols,
+    people_dict: dict,
+) -> bool:
+    """If day is not 輪休, every base employee must be assigned or be off."""
+    base_cols = [c for c in employee_cols if c in people_dict]
+    for dd in (daily_list[:DAYS_LIMIT] or []):
+        if not isinstance(dd, dict):
+            continue
+        # Skip 輪休 days (no shifts)
+        if not dd.get("班段"):
+            continue
+        d = int(dd.get("日期", 0) or 0)
+        for emp in base_cols:
+            info = people_dict.get(emp, {}) if isinstance(people_dict, dict) else {}
+            off_days = info.get("休假", []) or []
+            if d in off_days:
+                continue
+            if _has_assignment_on_day(dd, emp):
+                continue
+            return True
+    return False
             
 def get_required_skills_for_shift(shift_name: str, skill_df: pd.DataFrame) -> list[str]:
     """\
