@@ -10,6 +10,7 @@ from openpyxl import load_workbook
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -28,6 +29,7 @@ from 機場排班程式 import run_scheduler  # noqa: E402
 
 
 app = FastAPI(title="Airport Scheduler MVP")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 # Simple in-memory store for recent results (token -> metadata)
 _RESULTS: dict[str, dict] = {}
@@ -127,6 +129,7 @@ def home():
       <head>
         <meta charset="utf-8" />
         <title>Airport Scheduler</title>
+        <link rel="icon" href="/static/favicon.png" />
       </head>
       <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
         <h2>Upload Excel → Run → Download Excel</h2>
@@ -342,6 +345,7 @@ async def run(
               <head>
                 <meta charset="utf-8" />
                 <title>Airport Scheduler</title>
+                <link rel="icon" href="/static/favicon.png" />
               </head>
               <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
                 <h2>Running...</h2>
@@ -635,6 +639,7 @@ def preview(token: str):
           <head>
             <meta charset="utf-8" />
             <title>Preview</title>
+            <link rel="icon" href="/static/favicon.png" />
           </head>
             <body style="font-family: sans-serif; max-width: 1000px; margin: 24px auto; font-size:13px;">
             <div style="margin-bottom: 12px;">
