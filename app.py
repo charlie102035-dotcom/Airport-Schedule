@@ -481,7 +481,7 @@ def preview(token: str):
             if cell.font and cell.font.bold:
                 styles.append("font-weight: 700;")
             styles.append(f"width:{col_pct:.3f}%")
-            styles.append("min-width:90px")
+            styles.append("min-width:110px")
             style_attr = f' style="{" ".join(styles)}"'
             tag = "th" if r == 1 else "td"
             cells.append(f"<{tag}{style_attr}>{val}</{tag}>")
@@ -636,7 +636,7 @@ def preview(token: str):
             <meta charset="utf-8" />
             <title>Preview</title>
           </head>
-          <body style="font-family: sans-serif; max-width: 1000px; margin: 24px auto;">
+            <body style="font-family: sans-serif; max-width: 1000px; margin: 24px auto; font-size:13px;">
             <div style="margin-bottom: 12px;">
               <a href="/download/{token}" style="margin-right: 10px;">下載 Excel</a>
               <a href="/report/{token}">下載 PDF</a>

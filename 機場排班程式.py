@@ -828,6 +828,24 @@ def run_scheduler(
             except Exception:
                 pass
 
+    # Precompute pulled cells for coloring (use 原員工)
+    pulled_cells: set[tuple[int, str]] = set()
+    for dd in daily_list[:DAYS_LIMIT]:
+        if not isinstance(dd, dict):
+            continue
+        d = int(dd.get("日期", 0) or 0)
+        for _, recs in (dd.get("班段", {}) or {}).items():
+            if not isinstance(recs, list):
+                continue
+            for rec in recs:
+                if not isinstance(rec, dict):
+                    continue
+                if not bool(rec.get("拉班", False)):
+                    continue
+                name = str(rec.get("原員工", rec.get("人員", "")) or "").strip()
+                if name:
+                    pulled_cells.add((d, name))
+
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         roster_df.to_excel(writer, sheet_name="Roster")
         ws = writer.sheets["Roster"]
@@ -875,8 +893,9 @@ def run_scheduler(
 
             for j in range(2, max_col + 1):
                 c = ws.cell(row=i, column=j)
+                name = str(roster_df.columns[j - 2])
                 val = str(c.value or "")
-                if "拉" in val:
+                if (int(day), name) in pulled_cells:
                     c.fill = fill_pink
                 if best_is_bad and val == "":
                     c.fill = fill_red_empty
@@ -2636,7 +2655,7 @@ def _shift_cell_text(shift_name: str, rec: dict) -> str:
     if cover and cover != "填補":
         suffix = cover_map.get(cover, cover[:1])  # fallback：取第一個字
 
-    pull_mark = "拉" if pulled else ""
+    pull_mark = ""
 
     # 若有代班人：直接顯示「代班人+班號」（符合你要的：例如 秋芳10）
     sub = str(rec.get("代班人", "") or "").strip()
