@@ -123,7 +123,7 @@ def home():
       <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
         <h2>Upload Excel → Run → Download Excel</h2>
         <p>
-          <a href="https://docs.google.com/spreadsheets/d/1pzWkA2eVotA6G4fKjOdjmmL9v75zQJDkrq-v5vkRzKc/edit?usp=sharing" target="_blank" rel="noopener noreferrer">
+          <a href="https://drive.google.com/drive/folders/1mNXtRv5olbJQAGhnVy30mBoa8m4nTAJT?usp=sharing" target="_blank" rel="noopener noreferrer">
             下載模板
           </a>
         </p>
@@ -235,12 +235,12 @@ async def run(
                     bar.style.width = pct + '%';
                     const eta = data.eta_sec;
                     let etaText = '';
-                    if (eta !== null && eta !== undefined) {
+                    if (eta !== null && eta !== undefined) {{
                       const total = Math.max(0, Math.floor(eta));
                       const mm = Math.floor(total / 60);
                       const ss = total % 60;
                       etaText = ' | ETA ' + mm + 'm ' + ss + 's';
-                    }
+                    }}
                     txt.textContent = 'Try ' + (data.tries || 0) + ' / ' + (data.max_tries || 5000) + etaText;
                     if (data.status === 'done') {{
                       window.location.href = '/result/{token}';
