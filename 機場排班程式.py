@@ -597,11 +597,24 @@ def run_scheduler(
     # Run scheduling (search-best or single)
     # -------------------------
     used_search = bool(search_best_roster)
-    best_score = float("inf")
+    # Score: higher is better (we use negative std sum)
+    best_score = float("-inf")
     best_pull_std = float("inf")
     best_fair_std = float("inf")
     best_daily = None
     best_people = None
+
+    best_good_score = float("-inf")
+    best_good_pull_std = float("inf")
+    best_good_fair_std = float("inf")
+    best_good_daily = None
+    best_good_people = None
+
+    best_bad_score = float("-inf")
+    best_bad_pull_std = float("inf")
+    best_bad_fair_std = float("inf")
+    best_bad_daily = None
+    best_bad_people = None
     no_improve = 0
     total_tries = 0
     # If many attempts are skipped (RULE violations / pulls-nonzero constraint),
@@ -641,17 +654,40 @@ def run_scheduler(
 
             pull_std = _pull_std_ab(people_dict)
             fair_std = _fairness_sum_std_ab(people_dict)
-            score = pull_std + fair_std
+            score = -(pull_std + fair_std)
 
-            if score < best_score - 1e-12:
-                best_score = score
-                best_pull_std = pull_std
-                best_fair_std = fair_std
-                best_daily = copy.deepcopy(daily_list[:DAYS_LIMIT])
-                best_people = copy.deepcopy(people_dict)
-                no_improve = 0
+            has_empty = _violates_no_empty_on_workday(daily_list, employee_cols, people_dict)
+            if not has_empty:
+                if score > best_good_score + 1e-12:
+                    best_good_score = score
+                    best_good_pull_std = pull_std
+                    best_good_fair_std = fair_std
+                    best_good_daily = copy.deepcopy(daily_list[:DAYS_LIMIT])
+                    best_good_people = copy.deepcopy(people_dict)
+                    no_improve = 0
+                else:
+                    no_improve += 1
             else:
+                if score > best_bad_score + 1e-12:
+                    best_bad_score = score
+                    best_bad_pull_std = pull_std
+                    best_bad_fair_std = fair_std
+                    best_bad_daily = copy.deepcopy(daily_list[:DAYS_LIMIT])
+                    best_bad_people = copy.deepcopy(people_dict)
                 no_improve += 1
+
+        if best_good_daily is not None and best_good_people is not None:
+            best_score = best_good_score
+            best_pull_std = best_good_pull_std
+            best_fair_std = best_good_fair_std
+            best_daily = best_good_daily
+            best_people = best_good_people
+        elif best_bad_daily is not None and best_bad_people is not None:
+            best_score = best_bad_score
+            best_pull_std = best_bad_pull_std
+            best_fair_std = best_bad_fair_std
+            best_daily = best_bad_daily
+            best_people = best_bad_people
 
         if best_daily is None or best_people is None:
             raise ValueError(
@@ -672,11 +708,9 @@ def run_scheduler(
         _schedule_once()
         if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
             raise ValueError("[FINAL] Single run violated constraint: some A/B 拉班次數 is 0")
-        if _violates_no_empty_on_workday(daily_list, employee_cols, people_dict):
-            raise ValueError("[FINAL] Single run violated constraint: non-rest day has empty cell")
         best_pull_std = _pull_std_ab(people_dict)
         best_fair_std = _fairness_sum_std_ab(people_dict)
-        best_score = best_pull_std + best_fair_std
+        best_score = -(best_pull_std + best_fair_std)
 
     # -------------------------
     # Build output df + export to Excel

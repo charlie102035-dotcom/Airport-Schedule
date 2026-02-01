@@ -141,11 +141,6 @@ def home():
             <span id="minTriesVal">100</span>
           </p>
 
-          <p>
-            Patience:
-            <input type="number" name="patience" value="10" min="1" max="200" />
-          </p>
-
           <button type="submit">Run</button>
         </form>
       </body>
@@ -158,7 +153,6 @@ async def run(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     min_tries: int = Form(100),
-    patience: int = Form(10),
 ):
     # 1) 基本檢查：副檔名
     filename = (file.filename or "").lower()
@@ -196,7 +190,7 @@ async def run(
                     output_excel_path=str(out_path),
                     search_best_roster=True,
                     search_min_tries=min_tries_val,
-                    search_patience=int(patience),
+                    search_patience=10,
                     require_all_pulls_nonzero=False,
                     debug=False,
                     progress_callback=_cb,
@@ -240,7 +234,13 @@ async def run(
                     const pct = Math.floor((data.progress || 0) * 100);
                     bar.style.width = pct + '%';
                     const eta = data.eta_sec;
-                    const etaText = (eta === null || eta === undefined) ? '' : (' | ETA ' + eta.toFixed(1) + 's');
+                    let etaText = '';
+                    if (eta !== null && eta !== undefined) {
+                      const total = Math.max(0, Math.floor(eta));
+                      const mm = Math.floor(total / 60);
+                      const ss = total % 60;
+                      etaText = ' | ETA ' + mm + 'm ' + ss + 's';
+                    }
                     txt.textContent = 'Try ' + (data.tries || 0) + ' / ' + (data.max_tries || 5000) + etaText;
                     if (data.status === 'done') {{
                       window.location.href = '/result/{token}';
