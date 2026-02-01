@@ -9,7 +9,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 # 讓 Python 找得到上層的「機場排班程式.py」
 import sys
@@ -33,13 +33,19 @@ def _store_result(
     tmpdir: Path,
     tries: int,
     best_score: float,
+    best_pull_std: float,
+    best_fair_std: float,
 ) -> None:
     _RESULTS[token] = {
         "out_path": out_path,
         "tmpdir": tmpdir,
         "tries": tries,
         "best_std": best_score,
+        "best_pull_std": best_pull_std,
+        "best_fair_std": best_fair_std,
         "ts": time.time(),
+        "status": "done",
+        "progress": 1.0,
     }
 
 
@@ -50,6 +56,36 @@ def _pop_result(token: str) -> dict | None:
 
 def _get_result(token: str) -> dict | None:
     return _RESULTS.get(token)
+
+
+def _init_progress(token: str, tmpdir: Path) -> None:
+    _RESULTS[token] = {
+        "tmpdir": tmpdir,
+        "ts": time.time(),
+        "start_ts": time.time(),
+        "status": "running",
+        "progress": 0.0,
+        "tries": 0,
+    }
+
+
+def _set_progress(token: str, current_try: int, max_tries: int) -> None:
+    data = _RESULTS.get(token)
+    if not data:
+        return
+    data["ts"] = time.time()
+    total = max(1, int(max_tries))
+    cur = max(0, int(current_try))
+    data["tries"] = cur
+    data["progress"] = min(1.0, cur / total)
+
+
+def _set_error(token: str, msg: str) -> None:
+    data = _RESULTS.get(token)
+    if not data:
+        return
+    data["status"] = "error"
+    data["message"] = msg
 
 
 def _hex_color(rgb) -> str:
@@ -91,7 +127,7 @@ def home():
           </a>
         </p>
 
-        <form id="runForm" action="/run" method="post" enctype="multipart/form-data">
+        <form action="/run" method="post" enctype="multipart/form-data">
           <p>
             Excel file (.xlsx):
             <input type="file" name="file" accept=".xlsx" required />
@@ -116,46 +152,6 @@ def home():
 
           <button type="submit">Run</button>
         </form>
-        <div id="progressWrap" style="margin-top: 20px; display: none;">
-          <div style="margin-bottom: 6px;">Running...</div>
-          <div style="width: 100%; height: 12px; border: 1px solid #999; background: #f2f2f2;">
-            <div id="progressBar" style="height: 100%; width: 0%; background: #4a90e2;"></div>
-          </div>
-          <div id="progressText" style="margin-top: 6px; font-size: 12px; color: #555;"></div>
-        </div>
-        <div id="errorText" style="margin-top: 12px; color: #b00020;"></div>
-        <script>
-          const form = document.getElementById('runForm');
-          const wrap = document.getElementById('progressWrap');
-          const bar = document.getElementById('progressBar');
-          const txt = document.getElementById('progressText');
-          const err = document.getElementById('errorText');
-          form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            err.textContent = '';
-            wrap.style.display = 'block';
-            bar.style.width = '0%';
-            const minTries = parseInt(form.min_tries.value || '700', 10);
-            const durationMs = Math.max(1, minTries) * 0.01 * 1000;
-            const start = performance.now();
-            const tick = (now) => {
-              const t = Math.min(1, (now - start) / durationMs);
-              bar.style.width = Math.floor(t * 100) + '%';
-              txt.textContent = 'Estimated time: ' + (durationMs / 1000).toFixed(2) + 's';
-              if (t < 1) requestAnimationFrame(tick);
-            };
-            requestAnimationFrame(tick);
-            try {
-              const resp = await fetch(form.action, { method: 'POST', body: new FormData(form) });
-              const html = await resp.text();
-              document.open();
-              document.write(html);
-              document.close();
-            } catch (e2) {
-              err.textContent = 'Run failed: ' + e2;
-            }
-          });
-        </script>
       </body>
     </html>
     """
@@ -191,29 +187,36 @@ async def run(
         if in_path.stat().st_size > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
-        # 5) 跑排班
-        try:
-            result = run_scheduler(
-                input_excel_path=str(in_path),
-                output_excel_path=str(out_path),
-                days_limit=int(days),
-                search_best_roster=True,
-                search_max_tries=5000,
-                search_min_tries=max(700, int(min_tries)),
-                search_patience=int(patience),
-                require_all_pulls_nonzero=False,
-                debug=False,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        # 6) 產生下載頁
         token = uuid.uuid4().hex
-        tries_used = int(result.get("tries", 0) or 0)
-        best_score = float(result.get("best_std", 0.0) or 0.0)
-        best_pull_std = float(result.get("best_pull_std", 0.0) or 0.0)
-        best_fair_std = float(result.get("best_fair_std", 0.0) or 0.0)
-        _store_result(token, out_path, tmpdir, tries_used, best_score)
+        _init_progress(token, tmpdir)
+
+        def _run_job() -> None:
+            try:
+                def _cb(cur: int, mx: int) -> None:
+                    _set_progress(token, cur, mx)
+
+                result = run_scheduler(
+                    input_excel_path=str(in_path),
+                    output_excel_path=str(out_path),
+                    days_limit=int(days),
+                    search_best_roster=True,
+                    search_max_tries=5000,
+                    search_min_tries=max(700, int(min_tries)),
+                    search_patience=int(patience),
+                    require_all_pulls_nonzero=False,
+                    debug=False,
+                    progress_callback=_cb,
+                )
+
+                tries_used = int(result.get("tries", 0) or 0)
+                best_score = float(result.get("best_std", 0.0) or 0.0)
+                best_pull_std = float(result.get("best_pull_std", 0.0) or 0.0)
+                best_fair_std = float(result.get("best_fair_std", 0.0) or 0.0)
+                _store_result(token, out_path, tmpdir, tries_used, best_score, best_pull_std, best_fair_std)
+            except Exception as e:
+                _set_error(token, str(e))
+
+        background_tasks.add_task(_run_job)
 
         return HTMLResponse(
             f"""
@@ -223,17 +226,36 @@ async def run(
                 <title>Airport Scheduler</title>
               </head>
               <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-                <h2>完成</h2>
-                <p>Tries: {tries_used}</p>
-                <p>Best score (pull std + fairness std): {best_score:.4f}</p>
-                <p>Pull std: {best_pull_std:.4f}</p>
-                <p>Fairness std: {best_fair_std:.4f}</p>
-                <p><a href="/download/{token}">下載結果 Excel</a></p>
-                <p><a href="/preview/{token}">預覽結果（含顏色）</a></p>
-                <div style="border: 1px solid #ddd; padding: 12px; overflow: auto;">
-                  <iframe src="/preview/{token}" style="width: 100%; height: 520px; border: 0;"></iframe>
+                <h2>Running...</h2>
+                <div style="width: 100%; height: 12px; border: 1px solid #999; background: #f2f2f2;">
+                  <div id="progressBar" style="height: 100%; width: 0%; background: #4a90e2;"></div>
                 </div>
-                <p><a href="/">回首頁</a></p>
+                <div id="progressText" style="margin-top: 6px; font-size: 12px; color: #555;"></div>
+                <div id="errorText" style="margin-top: 12px; color: #b00020;"></div>
+                <script>
+                  const bar = document.getElementById('progressBar');
+                  const txt = document.getElementById('progressText');
+                  const err = document.getElementById('errorText');
+                  async function poll() {{
+                    const resp = await fetch('/progress/{token}');
+                    const data = await resp.json();
+                    if (data.status === 'error') {{
+                      err.textContent = data.message || 'Run failed.';
+                      return;
+                    }}
+                    const pct = Math.floor((data.progress || 0) * 100);
+                    bar.style.width = pct + '%';
+                    const eta = data.eta_sec;
+                    const etaText = (eta === null || eta === undefined) ? '' : (' | ETA ' + eta.toFixed(1) + 's');
+                    txt.textContent = 'Try ' + (data.tries || 0) + ' / ' + (data.max_tries || 5000) + etaText;
+                    if (data.status === 'done') {{
+                      window.location.href = '/result/{token}';
+                      return;
+                    }}
+                    setTimeout(poll, 500);
+                  }}
+                  poll();
+                </script>
               </body>
             </html>
             """
@@ -261,6 +283,72 @@ def download(token: str, background_tasks: BackgroundTasks):
         path=str(out_path),
         filename="roster_output.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.get("/progress/{token}")
+def progress(token: str):
+    data = _get_result(token)
+    if not data:
+        return JSONResponse({"status": "error", "message": "Result expired or not found."}, status_code=404)
+    now = time.time()
+    start_ts = float(data.get("start_ts", now) or now)
+    tries = int(data.get("tries", 0) or 0)
+    max_tries = 5000
+    eta_sec = None
+    elapsed = max(0.0, now - start_ts)
+    if tries > 0 and elapsed > 0.5:
+        rate = tries / elapsed
+        if rate > 0:
+            remaining = max(0, max_tries - tries)
+            eta_sec = remaining / rate
+    return JSONResponse(
+        {
+            "status": data.get("status", "running"),
+            "progress": float(data.get("progress", 0.0) or 0.0),
+            "tries": tries,
+            "max_tries": max_tries,
+            "eta_sec": eta_sec,
+            "message": data.get("message", ""),
+        }
+    )
+
+
+@app.get("/result/{token}", response_class=HTMLResponse)
+def result_page(token: str):
+    data = _get_result(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="Result expired or not found.")
+    if data.get("status") != "done":
+        raise HTTPException(status_code=400, detail="Result not ready.")
+
+    tries_used = int(data.get("tries", 0) or 0)
+    best_score = float(data.get("best_std", 0.0) or 0.0)
+    best_pull_std = float(data.get("best_pull_std", 0.0) or 0.0)
+    best_fair_std = float(data.get("best_fair_std", 0.0) or 0.0)
+
+    return HTMLResponse(
+        f"""
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>Airport Scheduler</title>
+          </head>
+          <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
+            <h2>完成</h2>
+            <p>Tries: {tries_used}</p>
+            <p>Best score (pull std + fairness std): {best_score:.4f}</p>
+            <p>Pull std: {best_pull_std:.4f}</p>
+            <p>Fairness std: {best_fair_std:.4f}</p>
+            <p><a href="/download/{token}">下載結果 Excel</a></p>
+            <p><a href="/preview/{token}">預覽結果（含顏色）</a></p>
+            <div style="border: 1px solid #ddd; padding: 12px; overflow: auto;">
+              <iframe src="/preview/{token}" style="width: 100%; height: 520px; border: 0;"></iframe>
+            </div>
+            <p><a href="/">回首頁</a></p>
+          </body>
+        </html>
+        """
     )
 
 

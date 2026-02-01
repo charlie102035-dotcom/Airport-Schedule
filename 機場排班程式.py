@@ -152,6 +152,7 @@ def run_scheduler(
     smart_team_pick: bool = True,
     debug: bool = False,
     random_seed: int | None = None,
+    progress_callback=None,
 ) -> dict:
     """Run scheduler from an uploaded Excel and export an output Excel.
 
@@ -571,6 +572,11 @@ def run_scheduler(
     if search_best_roster:
         for t in range(1, SEARCH_MAX_TRIES + 1):
             total_tries = t
+            if callable(progress_callback):
+                try:
+                    progress_callback(t, SEARCH_MAX_TRIES)
+                except Exception:
+                    pass
             try:
                 _schedule_once()
             except ValueError as e:
@@ -618,6 +624,11 @@ def run_scheduler(
 
     else:
         total_tries = 1
+        if callable(progress_callback):
+            try:
+                progress_callback(1, 1)
+            except Exception:
+                pass
         _schedule_once()
         if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
             raise ValueError("[FINAL] Single run violated constraint: some A/B 拉班次數 is 0")
