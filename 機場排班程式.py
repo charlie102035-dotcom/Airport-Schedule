@@ -603,6 +603,7 @@ def run_scheduler(
     best_fair_std = float("inf")
     best_daily = None
     best_people = None
+    best_is_bad = False
 
     best_good_score = float("-inf")
     best_good_pull_std = float("inf")
@@ -678,12 +679,14 @@ def run_scheduler(
             best_fair_std = best_good_fair_std
             best_daily = best_good_daily
             best_people = best_good_people
+            best_is_bad = False
         elif best_bad_daily is not None and best_bad_people is not None:
             best_score = best_bad_score
             best_pull_std = best_bad_pull_std
             best_fair_std = best_bad_fair_std
             best_daily = best_bad_daily
             best_people = best_bad_people
+            best_is_bad = True
 
         if best_daily is None or best_people is None:
             raise ValueError(
@@ -751,6 +754,7 @@ def run_scheduler(
         fill_green = PatternFill("solid", fgColor="C6E0B4")
         fill_gray = PatternFill("solid", fgColor="E7E6E6")
         fill_pink = PatternFill("solid", fgColor="F8CBAD")
+        fill_red_empty = PatternFill("solid", fgColor="F4CCCC")
 
         header_font = Font(bold=True)
         center = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -791,6 +795,8 @@ def run_scheduler(
                 val = str(c.value or "")
                 if "拉" in val:
                     c.fill = fill_pink
+                if best_is_bad and val == "":
+                    c.fill = fill_red_empty
 
         ws.row_dimensions[1].height = 22
 
@@ -800,6 +806,7 @@ def run_scheduler(
         "best_std": float(best_score),
         "best_pull_std": float(best_pull_std),
         "best_fair_std": float(best_fair_std),
+        "best_is_bad": bool(best_is_bad),
         "used_search": bool(used_search),
     }
 
