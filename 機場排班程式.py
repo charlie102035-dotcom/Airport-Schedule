@@ -645,10 +645,6 @@ def run_scheduler(
                 skip_streak += 1
                 continue
 
-            if _violates_no_empty_on_workday(daily_list, employee_cols, people_dict):
-                skip_streak += 1
-                continue
-
             # We have a valid roster attempt; reset skip streak.
             skip_streak = 0
 
