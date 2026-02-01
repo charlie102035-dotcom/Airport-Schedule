@@ -141,9 +141,9 @@ def home():
 
           <p>
             Min tries:
-            <input type="range" name="min_tries" value="700" min="700" max="5000" step="10"
+            <input type="range" name="min_tries" value="100" min="100" max="5000" step="10"
                    oninput="document.getElementById('minTriesVal').textContent=this.value" />
-            <span id="minTriesVal">700</span>
+            <span id="minTriesVal">100</span>
           </p>
 
           <p>
@@ -163,7 +163,7 @@ async def run(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     days: int = Form(28),
-    min_tries: int = Form(700),
+    min_tries: int = Form(100),
     patience: int = Form(10),
 ):
     # 1) 基本檢查：副檔名
@@ -189,7 +189,7 @@ async def run(
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
         token = uuid.uuid4().hex
-        min_tries_val = max(700, int(min_tries))
+        min_tries_val = max(100, int(min_tries))
         _init_progress(token, tmpdir, min_tries_val)
 
         def _run_job() -> None:

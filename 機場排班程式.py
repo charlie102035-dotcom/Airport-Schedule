@@ -145,7 +145,7 @@ def run_scheduler(
     include_external: bool = False,
     search_best_roster: bool = True,
     search_max_tries: int = 5000,
-    search_min_tries: int = 700,
+    search_min_tries: int = 100,
     search_patience: int = 10,
     require_all_pulls_nonzero: bool = True,
     reset_before_sched: bool = True,
@@ -1774,7 +1774,7 @@ def get_shift_demands(variables_df: pd.DataFrame) -> tuple[str, dict[str, int]]:
 # =========================
 SEARCH_BEST_ROSTER = True
 SEARCH_MAX_TRIES = 5000   # hard cap to avoid infinite loops
-SEARCH_MIN_TRIES = 700    # always try at least this many times before early-stop
+SEARCH_MIN_TRIES = 100    # always try at least this many times before early-stop
 SEARCH_PATIENCE = 10      # stop if no improvement within this many tries after best
 
 
