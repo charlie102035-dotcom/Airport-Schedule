@@ -58,7 +58,7 @@ def _get_result(token: str) -> dict | None:
     return _RESULTS.get(token)
 
 
-def _init_progress(token: str, tmpdir: Path) -> None:
+def _init_progress(token: str, tmpdir: Path, min_tries: int) -> None:
     _RESULTS[token] = {
         "tmpdir": tmpdir,
         "ts": time.time(),
@@ -66,6 +66,7 @@ def _init_progress(token: str, tmpdir: Path) -> None:
         "status": "running",
         "progress": 0.0,
         "tries": 0,
+        "min_tries": int(min_tries),
     }
 
 
@@ -188,7 +189,8 @@ async def run(
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
         token = uuid.uuid4().hex
-        _init_progress(token, tmpdir)
+        min_tries_val = max(700, int(min_tries))
+        _init_progress(token, tmpdir, min_tries_val)
 
         def _run_job() -> None:
             try:
@@ -201,7 +203,7 @@ async def run(
                     days_limit=int(days),
                     search_best_roster=True,
                     search_max_tries=5000,
-                    search_min_tries=max(700, int(min_tries)),
+                    search_min_tries=min_tries_val,
                     search_patience=int(patience),
                     require_all_pulls_nonzero=False,
                     debug=False,
@@ -294,7 +296,7 @@ def progress(token: str):
     now = time.time()
     start_ts = float(data.get("start_ts", now) or now)
     tries = int(data.get("tries", 0) or 0)
-    max_tries = 5000
+    max_tries = int(data.get("min_tries", 5000) or 5000)
     eta_sec = None
     elapsed = max(0.0, now - start_ts)
     if tries > 0 and elapsed > 0.5:

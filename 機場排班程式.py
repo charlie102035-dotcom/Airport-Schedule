@@ -574,7 +574,7 @@ def run_scheduler(
             total_tries = t
             if callable(progress_callback):
                 try:
-                    progress_callback(t, SEARCH_MAX_TRIES)
+                    progress_callback(t, SEARCH_MIN_TRIES)
                 except Exception:
                     pass
             try:
@@ -585,7 +585,15 @@ def run_scheduler(
                     if skip_streak >= max_skip_streak:
                         break
                     continue
-                raise
+                skip_streak += 1
+                if skip_streak >= max_skip_streak:
+                    break
+                continue
+            except Exception:
+                skip_streak += 1
+                if skip_streak >= max_skip_streak:
+                    break
+                continue
 
             if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
                 skip_streak += 1
