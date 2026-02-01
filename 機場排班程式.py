@@ -25,6 +25,315 @@ def _debug(msg: str) -> None:
     if DEBUG_SCHED:
         print(msg)
 
+def validate_input_excel(input_excel_path: str) -> list[dict]:
+    """Validate input Excel before scheduling.
+
+    Returns a list of issues:
+      [{"sheet": str, "columns": [str, ...], "reason": str}, ...]
+    """
+    issues: list[dict] = []
+
+    xls_path = os.path.abspath(os.path.expanduser(str(input_excel_path)))
+    if not os.path.exists(xls_path):
+        return [{"sheet": "檔案", "columns": ["input_excel_path"], "reason": "找不到檔案"}]
+
+    required_sheets = ["排休", "職能", "參數設定"]
+    try:
+        xls = pd.ExcelFile(xls_path)
+        sheet_names = set(xls.sheet_names or [])
+    except Exception:
+        return [{"sheet": "檔案", "columns": ["Excel"], "reason": "無法讀取Excel"}]
+
+    for sheet in required_sheets:
+        if sheet not in sheet_names:
+            issues.append({"sheet": sheet, "columns": [], "reason": "缺少工作表"})
+
+    # 排休 sheet checks
+    if "排休" in sheet_names:
+        try:
+            dayoff_raw = pd.read_excel(xls_path, sheet_name="排休")
+            cols = [str(c).strip() for c in dayoff_raw.columns]
+            sheet_issues: list[str] = []
+
+            def _date_series(df: pd.DataFrame):
+                if "日期" not in df.columns:
+                    return None
+                ds = df["日期"]
+                if isinstance(ds, pd.DataFrame):
+                    ds = ds.iloc[:, 0]
+                return pd.to_numeric(ds, errors="coerce")
+
+            def _detect_data_start_idx(df: pd.DataFrame, emp_cols: list[str]) -> int:
+                PART_MARKERS = {"A", "B", "C"}
+
+                def _norm(v) -> str:
+                    if pd.isna(v):
+                        return ""
+                    return str(v).strip()
+
+                def _norm_id(v) -> str:
+                    if pd.isna(v):
+                        return ""
+                    s = str(v).strip()
+                    if s == "":
+                        return ""
+                    try:
+                        f = float(s)
+                        if f.is_integer():
+                            return str(int(f))
+                    except Exception:
+                        pass
+                    return s
+
+                def _looks_like_id(v: str) -> bool:
+                    if v == "":
+                        return False
+                    u = v.upper()
+                    if u in PART_MARKERS:
+                        return False
+                    if any(tok in v for tok in ["休", "請假", "代", "代班"]):
+                        return False
+                    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- ")
+                    return all(ch in allowed for ch in u)
+
+                def _score_part_row(row) -> float:
+                    vals = [_norm(row.get(emp, "")).upper() for emp in emp_cols]
+                    if not vals:
+                        return 0.0
+                    hit = sum(v in PART_MARKERS for v in vals)
+                    return hit / len(vals)
+
+                def _score_id_row(row) -> float:
+                    vals = [_norm_id(row.get(emp, "")) for emp in emp_cols]
+                    if not vals:
+                        return 0.0
+                    hit = sum(_looks_like_id(v) for v in vals)
+                    return hit / len(vals)
+
+                search_n = 8
+                best_part_i, best_part_score = None, -1.0
+                best_id_i, best_id_score = None, -1.0
+
+                for i in range(min(search_n, len(df))):
+                    row = df.iloc[i]
+                    ps = _score_part_row(row)
+                    if ps > best_part_score:
+                        best_part_score = ps
+                        best_part_i = i
+                    ids = _score_id_row(row)
+                    if ids > best_id_score:
+                        best_id_score = ids
+                        best_id_i = i
+
+                if best_id_i == best_part_i:
+                    best_id_i, best_id_score = None, -1.0
+                    for i in range(min(search_n, len(df))):
+                        if i == best_part_i:
+                            continue
+                        ids = _score_id_row(df.iloc[i])
+                        if ids > best_id_score:
+                            best_id_score = ids
+                            best_id_i = i
+
+                default_start = 3 if len(df) > 3 else 0
+                if best_part_i is None and best_id_i is None:
+                    return default_start
+                idxs = [i for i in (best_part_i, best_id_i) if i is not None]
+                if not idxs:
+                    return default_start
+                return max(idxs) + 1
+
+            def _norm_cell(v) -> str:
+                if pd.isna(v):
+                    return ""
+                return str(v).strip()
+
+            if len(cols) < 2:
+                sheet_issues.extend(["工作(第1欄)", "日期(第2欄)"])
+            else:
+                if cols[0] != "工作":
+                    sheet_issues.append("工作(第1欄)")
+                if cols[1] != "日期":
+                    sheet_issues.append("日期(第2欄)")
+
+            if len(cols) <= 2:
+                sheet_issues.append("員工欄位(第3欄起)")
+
+            if "日期" in cols:
+                dates = _date_series(dayoff_raw)
+                if dates is not None and dates.dropna().empty:
+                    sheet_issues.append("日期(需有數值)")
+
+            if sheet_issues:
+                issues.append(
+                    {"sheet": "排休", "columns": sheet_issues, "reason": "欄位不符合模板"}
+                )
+
+            # Strict check for dayoff cells: only allow empty / 休 / 代*
+            typo_cols: set[str] = set()
+            typo_cells: list[dict] = []
+            if len(cols) > 2:
+                employee_col_info = [(i, cols[i]) for i in range(2, len(cols))]
+                data_start_idx = _detect_data_start_idx(dayoff_raw, cols[2:])
+                data_block = dayoff_raw.iloc[data_start_idx:].copy() if len(dayoff_raw) > data_start_idx else dayoff_raw.copy()
+                dates = _date_series(data_block)
+                for col_idx, col_name in employee_col_info:
+                    try:
+                        s = data_block.iloc[:, col_idx].fillna("").astype(str).str.strip()
+                    except Exception:
+                        continue
+                    if s.eq("").all():
+                        continue
+                    mask = ~(
+                        s.eq("")
+                        | s.eq("休")
+                        | s.eq("請假")
+                        | s.eq("優")
+                        | s.str.startswith("代")
+                    )
+                    if mask.any():
+                        typo_cols.add(col_name)
+                        if dates is not None:
+                            for idx in data_block.index[mask]:
+                                try:
+                                    d = dates.loc[idx]
+                                    if pd.isna(d):
+                                        continue
+                                    row_pos = data_block.index.get_loc(idx)
+                                    if not isinstance(row_pos, int):
+                                        continue
+                                    val = _norm_cell(data_block.iloc[row_pos, col_idx])
+                                    typo_cells.append({"day": int(d), "person": str(col_name), "value": val})
+                                except Exception:
+                                    continue
+            if typo_cols:
+                issues.append(
+                    {
+                        "sheet": "排休",
+                        "columns": sorted(typo_cols),
+                        "reason": "含不合規字元(僅允許空白/休/請假/優/代開頭)",
+                        "cells": typo_cells,
+                    }
+                )
+
+            # Check 輪休 rows must be empty in employee columns
+            if len(cols) > 2:
+                employee_col_info = [(i, cols[i]) for i in range(2, len(cols))]
+                data_block = dayoff_raw.copy()
+                if "工作" in data_block.columns:
+                    rest_mask = data_block["工作"].fillna("").astype(str).str.strip() == "輪休"
+                    if rest_mask.any():
+                        dates = _date_series(data_block)
+                        bad_cols: set[str] = set()
+                        rest_cells: list[dict] = []
+                        for row_idx in data_block.index[rest_mask]:
+                            try:
+                                row_pos = data_block.index.get_loc(row_idx)
+                                if not isinstance(row_pos, int):
+                                    continue
+                            except Exception:
+                                continue
+                            for col_idx, col_name in employee_col_info:
+                                try:
+                                    val = _norm_cell(data_block.iloc[row_pos, col_idx])
+                                except Exception:
+                                    continue
+                                if val == "":
+                                    continue
+                                bad_cols.add(col_name)
+                                if dates is not None:
+                                    try:
+                                        d = dates.loc[row_idx]
+                                        if pd.isna(d):
+                                            continue
+                                        rest_cells.append({"day": int(d), "person": str(col_name), "value": val})
+                                    except Exception:
+                                        continue
+                        if bad_cols:
+                            issues.append(
+                                {
+                                    "sheet": "排休",
+                                    "columns": sorted(bad_cols),
+                                    "reason": "輪休天誤植資訊",
+                                    "cells": rest_cells,
+                                }
+                            )
+        except Exception:
+            issues.append({"sheet": "排休", "columns": [], "reason": "讀取失敗"})
+
+    # 職能 sheet checks
+    if "職能" in sheet_names:
+        try:
+            skill_df = pd.read_excel(xls_path, sheet_name="職能")
+            cols = [str(c).strip() for c in skill_df.columns]
+            sheet_issues: list[str] = []
+
+            front_cols = cols[: min(7, len(cols))]
+            required_shift_cols = ["入境10", "入境11", "出境5", "出境6", "出境7", "出境8"]
+            missing_shift_cols = [c for c in required_shift_cols if c not in front_cols]
+            sheet_issues.extend(missing_shift_cols)
+
+            name_cols = ["職位", "職能", "技能", "能力"]
+            if not any(c in front_cols for c in name_cols):
+                sheet_issues.append("職能名稱欄(職位/職能/技能/能力)")
+
+            if len(cols) < 8:
+                sheet_issues.append("員工欄位(第8欄起)")
+
+            if sheet_issues:
+                issues.append(
+                    {"sheet": "職能", "columns": sheet_issues, "reason": "欄位不符合模板"}
+                )
+        except Exception:
+            issues.append({"sheet": "職能", "columns": [], "reason": "讀取失敗"})
+
+    # 參數設定 sheet checks
+    if "參數設定" in sheet_names:
+        try:
+            variables_df = pd.read_excel(xls_path, sheet_name="參數設定")
+            cols = [str(c).strip() for c in variables_df.columns]
+            sheet_issues: list[str] = []
+
+            required_cols = [
+                "第一輪早班？",
+                "入境10人數",
+                "入境11人數",
+                "出境5人數",
+                "出境6人數",
+                "出境7人數",
+                "出境8人數",
+            ]
+            missing_cols = [c for c in required_cols if c not in cols]
+            sheet_issues.extend(missing_cols)
+
+            if "第一輪早班？" in cols and len(variables_df) > 0:
+                v = str(variables_df.iloc[0].get("第一輪早班？", "")).strip()
+                if v not in ("A", "B"):
+                    sheet_issues.append("第一輪早班？(值需A/B)")
+
+            for col in [
+                "入境10人數",
+                "入境11人數",
+                "出境5人數",
+                "出境6人數",
+                "出境7人數",
+                "出境8人數",
+            ]:
+                if col in cols and len(variables_df) > 0:
+                    v = variables_df.iloc[0].get(col, None)
+                    num = pd.to_numeric(v, errors="coerce")
+                    if pd.isna(num):
+                        sheet_issues.append(f"{col}(需為數字)")
+
+            if sheet_issues:
+                issues.append(
+                    {"sheet": "參數設定", "columns": sheet_issues, "reason": "欄位不符合模板"}
+                )
+        except Exception:
+            issues.append({"sheet": "參數設定", "columns": [], "reason": "讀取失敗"})
+
+    return issues
+
 def reset_schedule_state(daily_list: list[dict], people_dict: dict) -> None:
     """Hard reset all mutable scheduling state.
 
@@ -276,17 +585,9 @@ def run_scheduler(
     skill = pd.read_excel(xls_path, sheet_name="職能")
     variables = pd.read_excel(xls_path, sheet_name="參數設定")
 
-    # -------------------------
-    # Parse dayoff
-    # -------------------------
-    dayoff = dayoff_raw.iloc[3:].copy()
-    dayoff["日期"] = pd.to_numeric(dayoff["日期"], errors="coerce")
-    dayoff = dayoff.dropna(subset=["日期"]).copy()
-    dayoff["日期"] = dayoff["日期"].astype(int)
-
     # Build people_dict shell
     people_dict = {}
-    employee_cols = dayoff.columns[2:]
+    employee_cols = dayoff_raw.columns[2:]
 
     PART_MARKERS = {"A", "B", "C"}
 
@@ -360,6 +661,20 @@ def run_scheduler(
             if ids > best_id_score:
                 best_id_score = ids
                 best_id_i = i
+
+    data_start_idx = 3
+    if best_part_i is not None or best_id_i is not None:
+        idxs = [i for i in (best_part_i, best_id_i) if i is not None]
+        if idxs:
+            data_start_idx = max(idxs) + 1
+
+    # -------------------------
+    # Parse dayoff (after detecting header rows)
+    # -------------------------
+    dayoff = dayoff_raw.iloc[data_start_idx:].copy()
+    dayoff["日期"] = pd.to_numeric(dayoff["日期"], errors="coerce")
+    dayoff = dayoff.dropna(subset=["日期"]).copy()
+    dayoff["日期"] = dayoff["日期"].astype(int)
 
     part_row = dayoff_raw.iloc[best_part_i] if best_part_i is not None else dayoff_raw.iloc[0]
     id_row = dayoff_raw.iloc[best_id_i] if best_id_i is not None else dayoff_raw.iloc[0]

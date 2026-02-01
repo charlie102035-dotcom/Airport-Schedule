@@ -25,7 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-from 機場排班程式 import run_scheduler  # noqa: E402
+from 機場排班程式 import run_scheduler, validate_input_excel  # noqa: E402
 
 
 app = FastAPI(title="Airport Scheduler MVP")
@@ -97,6 +97,37 @@ def _set_error(token: str, msg: str) -> None:
         return
     data["status"] = "error"
     data["message"] = msg
+
+
+def _format_validation_errors(errors: list[dict]) -> str:
+    lines = []
+    for err in errors:
+        sheet = str(err.get("sheet", "") or "")
+        cols = err.get("columns", []) or []
+        reason = str(err.get("reason", "") or "")
+        cells = err.get("cells", []) or []
+        col_text = ", ".join([str(c) for c in cols if str(c).strip() != ""])
+        if reason and col_text:
+            line = f"{sheet}: {reason} -> {col_text}"
+        elif reason:
+            line = f"{sheet}: {reason}"
+        elif col_text:
+            line = f"{sheet}: {col_text}"
+        else:
+            line = f"{sheet}: 欄位不符合模板"
+        lines.append(line)
+        if cells:
+            for cell in cells:
+                day = cell.get("day", None)
+                person = str(cell.get("person", "") or "").strip()
+                value = str(cell.get("value", "") or "").strip()
+                if day is None or person == "":
+                    continue
+                if value != "":
+                    lines.append(f"請檢查{int(day)}號的{person}（值={value}）")
+                else:
+                    lines.append(f"請檢查{int(day)}號的{person}")
+    return "\n".join(lines) if lines else "輸入檔案格式不正確。"
 
 
 def _hex_color(rgb) -> str:
@@ -308,6 +339,36 @@ async def run(
         if in_path.stat().st_size > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
+        # 4.1) 輸入資料檢查：立即回報錯誤欄位並返回首頁
+        validation_errors = validate_input_excel(str(in_path))
+        if validation_errors:
+            msg = _format_validation_errors(validation_errors)
+            safe_msg = (
+                msg.replace("\\", "\\\\").replace("\n", "\\n").replace("'", "\\'")
+            )
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return HTMLResponse(
+                f"""
+                <html>
+                  <head>
+                    <meta charset="utf-8" />
+                    <title>輸入資料錯誤</title>
+                    <link rel="icon" href="/static/favicon.png" />
+                  </head>
+                  <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
+                    <script>
+                      alert('{safe_msg}');
+                      window.location.href = '/';
+                    </script>
+                    <p>輸入資料有誤，請依照提示修正後重試。</p>
+                    <pre style="white-space: pre-wrap; border: 1px solid #ddd; padding: 10px;">{msg}</pre>
+                    <p><a href="/">回首頁</a></p>
+                  </body>
+                </html>
+                """,
+                status_code=400,
+            )
+
         token = uuid.uuid4().hex
         _init_progress(token, tmpdir, 100)
 
@@ -355,6 +416,10 @@ async def run(
                 <div id="progressText" style="margin-top: 6px; font-size: 12px; color: #555;"></div>
                 <div id="errorText" style="margin-top: 12px; color: #b00020;"></div>
                 <script>
+                  const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+                  if (navEntry && navEntry.type === 'reload') {{
+                    window.location.replace('/');
+                  }}
                   const bar = document.getElementById('progressBar');
                   const txt = document.getElementById('progressText');
                   const err = document.getElementById('errorText');
@@ -642,6 +707,12 @@ def preview(token: str):
             <link rel="icon" href="/static/favicon.png" />
           </head>
             <body style="font-family: sans-serif; max-width: 1000px; margin: 24px auto; font-size:13px;">
+            <script>
+              const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+              if (navEntry && navEntry.type === 'reload') {{
+                window.location.replace('/');
+              }}
+            </script>
             <div style="margin-bottom: 12px;">
               <a href="/download/{token}" style="margin-right: 10px;">下載 Excel</a>
               <a href="/report/{token}">下載 PDF</a>
