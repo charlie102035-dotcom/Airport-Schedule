@@ -15,9 +15,10 @@ from openpyxl.utils import get_column_letter
 # =========================
 DEBUG_SCHED = False
 RESET_BEFORE_SCHED = True
-SMART_TEAM_PICK = True  # dynamically switch A/B based on today's remaining pool to reduce forced pulls
+SMART_TEAM_PICK = False  # fixed A/B by early/late rules; no dynamic switching
 
 SHIFT_ORDER = ["出境5", "出境6", "入境10", "入境11", "出境7", "出境8"]
+RESCUE_FILL_ALL = True  # if still short after round2, keep pulling until cand exhausted
 
 
 def _debug(msg: str) -> None:
@@ -32,7 +33,7 @@ def reset_schedule_state(daily_list: list[dict], people_dict: dict) -> None:
 
     Resets:
     - each day: _cand, 特殊職務, and each shift list under 班段
-    - each employee: 拉班次數, 公平性分數 (set all existing keys back to 0)
+    - each employee: 拉班次數, 公平性分數, 班段次數 (set all existing keys back to 0)
     """
 
     # 1) Reset per-day state
@@ -68,6 +69,12 @@ def reset_schedule_state(daily_list: list[dict], people_dict: dict) -> None:
             for k in list(fairness.keys()):
                 fairness[k] = 0
             info["公平性分數"] = fairness
+
+        shift_counts = info.get("班段次數", {})
+        if isinstance(shift_counts, dict):
+            for k in list(shift_counts.keys()):
+                shift_counts[k] = 0
+            info["班段次數"] = shift_counts
 
 
 def debug_state_snapshot(daily_list: list[dict], people_dict: dict, days_n: int = 5) -> None:
@@ -136,6 +143,10 @@ shift_demands: dict[str, int] = {}
 # Default limit used by scheduling/output helpers
 DAYS_LIMIT = 28
 
+# Optional overrides for pipeline/scorers
+TEAM_PIPELINE_OVERRIDE: dict | None = None
+TEAM_SCORERS_NONPULL_OVERRIDE: dict | None = None
+
 
 def run_scheduler(
     input_excel_path: str,
@@ -144,7 +155,6 @@ def run_scheduler(
     days_limit: int | None = None,
     include_external: bool = False,
     search_best_roster: bool = True,
-    search_min_tries: int = 100,
     search_patience: int = 10,
     require_all_pulls_nonzero: bool = True,
     reset_before_sched: bool = True,
@@ -152,6 +162,9 @@ def run_scheduler(
     debug: bool = False,
     random_seed: int | None = None,
     progress_callback=None,
+    priority_mode: str = "team1",
+    custom_order: str = "fairness,shift_count",
+    rescue_fill: bool = True,
 ) -> dict:
     """Run scheduler from an uploaded Excel and export an output Excel.
 
@@ -163,9 +176,11 @@ def run_scheduler(
       {
         'output_path': str,
         'tries': int,
-        'best_std': float,        # combined score: pull_std + fair_std
+        'best_std': float,        # combined score: pull_std + fair_std + shift_std (negated)
         'best_pull_std': float,   # pull-count std (A/B)
         'best_fair_std': float,   # fairness-sum std (A/B)
+        'best_shift_std': float,  # shift-count std sum (A/B)
+        'best_score_100': float,  # normalized 0-100 score (higher is better)
         'used_search': bool,
       }
     """
@@ -176,16 +191,54 @@ def run_scheduler(
     global people_dict, employee_cols, daily_list, shift_demands
     global DAYS_LIMIT, DEBUG_SCHED, RESET_BEFORE_SCHED, SMART_TEAM_PICK
     global SEARCH_BEST_ROSTER, SEARCH_MAX_TRIES, SEARCH_MIN_TRIES, SEARCH_PATIENCE
+    global TEAM_PIPELINE_OVERRIDE, TEAM_SCORERS_NONPULL_OVERRIDE
+    global RESCUE_FILL_ALL
 
     # Apply run-time switches
     DEBUG_SCHED = bool(debug)
     RESET_BEFORE_SCHED = bool(reset_before_sched)
-    SMART_TEAM_PICK = bool(smart_team_pick)
+    SMART_TEAM_PICK = False
 
     SEARCH_BEST_ROSTER = bool(search_best_roster)
-    SEARCH_MIN_TRIES = int(search_min_tries)
-    SEARCH_MAX_TRIES = int(search_min_tries)
+    SEARCH_MIN_TRIES = 100
+    SEARCH_MAX_TRIES = 100
     SEARCH_PATIENCE = int(search_patience)
+    RESCUE_FILL_ALL = bool(rescue_fill)
+
+    # Configure scorer priority based on mode
+    priority_mode = str(priority_mode or "").strip().lower()
+    order = [s.strip() for s in str(custom_order or "").split(",") if s.strip()]
+    if not order:
+        order = ["fairness", "shift_count"]
+    if order[0] == order[1] if len(order) > 1 else False:
+        order = ["fairness", "shift_count"]
+
+    def _make_nonpull_scorers(order_list: list[str]):
+        mapping = {
+            "fairness": "_sc_fairness",
+            "shift_count": "_sc_shift_count",
+        }
+        return [mapping.get(k, "_sc_fairness") for k in order_list]
+
+    if priority_mode == "custom":
+        TEAM_SCORERS_NONPULL_OVERRIDE = {
+            "A": order,
+            "B": order,
+            "C": order,
+        }
+    elif priority_mode == "team3":
+        TEAM_SCORERS_NONPULL_OVERRIDE = {
+            "A": ["shift_count", "fairness"],
+            "B": ["shift_count", "fairness"],
+            "C": ["shift_count", "fairness"],
+        }
+    else:
+        # team1 / team2 default: fairness before shift count
+        TEAM_SCORERS_NONPULL_OVERRIDE = {
+            "A": ["fairness", "shift_count"],
+            "B": ["fairness", "shift_count"],
+            "C": ["fairness", "shift_count"],
+        }
 
     if days_limit is not None:
         DAYS_LIMIT = int(days_limit)
@@ -360,6 +413,7 @@ def run_scheduler(
             "職能": {},
             "公平性分數": {},
             "拉班次數": 0,
+            "班段次數": {sh: 0 for sh in SHIFT_ORDER},
         }
 
         sub_map: dict[int, str] = {}
@@ -601,6 +655,7 @@ def run_scheduler(
     best_score = float("-inf")
     best_pull_std = float("inf")
     best_fair_std = float("inf")
+    best_shift_std = float("inf")
     best_daily = None
     best_people = None
     best_is_bad = False
@@ -608,12 +663,14 @@ def run_scheduler(
     best_good_score = float("-inf")
     best_good_pull_std = float("inf")
     best_good_fair_std = float("inf")
+    best_good_shift_std = float("inf")
     best_good_daily = None
     best_good_people = None
 
     best_bad_score = float("-inf")
     best_bad_pull_std = float("inf")
     best_bad_fair_std = float("inf")
+    best_bad_shift_std = float("inf")
     best_bad_daily = None
     best_bad_people = None
     no_improve = 0
@@ -642,6 +699,9 @@ def run_scheduler(
                 skip_streak += 1
                 continue
 
+            # Post-fix module before scoring
+            _repair_in11_shortage(daily_list, people_dict, employee_cols)
+
             if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
                 skip_streak += 1
                 continue
@@ -651,7 +711,8 @@ def run_scheduler(
 
             pull_std = _pull_std_ab(people_dict)
             fair_std = _fairness_sum_std_ab(people_dict)
-            score = -(pull_std + fair_std)
+            shift_std = _shift_count_std_ab(people_dict)
+            score = -(pull_std + fair_std + shift_std)
 
             has_empty = _violates_no_empty_on_workday(daily_list, employee_cols, people_dict)
             if not has_empty:
@@ -659,6 +720,7 @@ def run_scheduler(
                     best_good_score = score
                     best_good_pull_std = pull_std
                     best_good_fair_std = fair_std
+                    best_good_shift_std = shift_std
                     best_good_daily = copy.deepcopy(daily_list[:DAYS_LIMIT])
                     best_good_people = copy.deepcopy(people_dict)
                     no_improve = 0
@@ -669,6 +731,7 @@ def run_scheduler(
                     best_bad_score = score
                     best_bad_pull_std = pull_std
                     best_bad_fair_std = fair_std
+                    best_bad_shift_std = shift_std
                     best_bad_daily = copy.deepcopy(daily_list[:DAYS_LIMIT])
                     best_bad_people = copy.deepcopy(people_dict)
                 no_improve += 1
@@ -677,6 +740,7 @@ def run_scheduler(
             best_score = best_good_score
             best_pull_std = best_good_pull_std
             best_fair_std = best_good_fair_std
+            best_shift_std = best_good_shift_std
             best_daily = best_good_daily
             best_people = best_good_people
             best_is_bad = False
@@ -684,6 +748,7 @@ def run_scheduler(
             best_score = best_bad_score
             best_pull_std = best_bad_pull_std
             best_fair_std = best_bad_fair_std
+            best_shift_std = best_bad_shift_std
             best_daily = best_bad_daily
             best_people = best_bad_people
             best_is_bad = True
@@ -705,11 +770,13 @@ def run_scheduler(
             except Exception:
                 pass
         _schedule_once()
+        _repair_in11_shortage(daily_list, people_dict, employee_cols)
         if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
             raise ValueError("[FINAL] Single run violated constraint: some A/B 拉班次數 is 0")
         best_pull_std = _pull_std_ab(people_dict)
         best_fair_std = _fairness_sum_std_ab(people_dict)
-        best_score = -(best_pull_std + best_fair_std)
+        best_shift_std = _shift_count_std_ab(people_dict)
+        best_score = -(best_pull_std + best_fair_std + best_shift_std)
 
     # -------------------------
     # Build output df + export to Excel
@@ -800,12 +867,19 @@ def run_scheduler(
 
         ws.row_dimensions[1].height = 22
 
+    # Normalize score to 0-100 (higher is better)
+    raw_total = float(best_pull_std + best_fair_std + best_shift_std)
+    norm = raw_total / (raw_total + 1.0) if raw_total >= 0 else 1.0
+    best_score_100 = max(0.0, min(100.0, (1.0 - norm) * 100.0))
+
     return {
         "output_path": out_path,
         "tries": int(total_tries),
         "best_std": float(best_score),
         "best_pull_std": float(best_pull_std),
         "best_fair_std": float(best_fair_std),
+        "best_shift_std": float(best_shift_std),
+        "best_score_100": float(best_score_100),
         "best_is_bad": bool(best_is_bad),
         "used_search": bool(used_search),
     }
@@ -932,6 +1006,197 @@ def _validate_hard_rules_in11_out_early(daily_list: list[dict], people_dict: dic
                 continue
             if _violates_in11_out_early(emp, d, people_dict):
                 raise ValueError(f"[RULE] 入境11→隔天出境早班違規: {emp} on day {d}")
+
+
+def _repair_in11_shortage(daily_list: list[dict], people_dict: dict, employee_cols) -> None:
+    """Rescue module before scoring: fill 入境11 shortages via 入境10 swap."""
+    base_cols = [c for c in employee_cols if c in people_dict]
+
+    def _day_assigned_set(dd: dict) -> set[str]:
+        assigned = set()
+        for _, recs in (dd.get("班段", {}) or {}).items():
+            if not isinstance(recs, list):
+                continue
+            for r in recs:
+                if not isinstance(r, dict):
+                    continue
+                who = str(r.get("原員工", r.get("人員", "")) or "").strip()
+                if who:
+                    assigned.add(who)
+        return assigned
+
+    def _is_off(emp: str, d: int) -> bool:
+        off_days = people_dict.get(emp, {}).get("休假", []) or []
+        return d in off_days
+
+    def _next_day_outbound_info(emp: str, d: int) -> tuple[bool, bool]:
+        nd = _next_day_dict(d)
+        if not nd or not isinstance(nd, dict):
+            return (False, False)
+        bd = nd.get("班段", {}) or {}
+        has_outbound = any(sh in bd for sh in ("出境5", "出境6", "出境7", "出境8"))
+        if not has_outbound:
+            return (False, False)
+        off_next = _is_off(emp, d + 1)
+        pulled_next = False
+        for sh in ("出境5", "出境6", "出境7", "出境8"):
+            recs = bd.get(sh, []) or []
+            if not isinstance(recs, list):
+                continue
+            for r in recs:
+                if not isinstance(r, dict):
+                    continue
+                who = str(r.get("原員工", r.get("人員", "")) or "").strip()
+                if who == emp and bool(r.get("拉班", False)):
+                    pulled_next = True
+                    break
+            if pulled_next:
+                break
+        return (off_next, pulled_next)
+
+    def _is_pull_for_shift(emp: str, dd: dict, shift_name: str) -> bool:
+        need_team = _needed_team_for_shift(dd, shift_name)
+        emp_team = str(people_dict.get(emp, {}).get("分組", "") or "")
+        if need_team not in ("A", "B"):
+            return False
+        return emp_team != need_team
+
+    for dd in (daily_list[:DAYS_LIMIT] or []):
+        if not dd.get("班段"):
+            continue
+        if "入境11" not in dd.get("班段", {}):
+            continue
+        d = int(dd.get("日期", 0) or 0)
+        need11 = int(shift_demands.get("入境11", 0) or 0)
+        recs11 = dd.get("班段", {}).get("入境11", [])
+        recs10 = dd.get("班段", {}).get("入境10", [])
+        if not isinstance(recs11, list) or not isinstance(recs10, list):
+            continue
+
+        while len(recs11) < need11:
+            assigned_today = _day_assigned_set(dd)
+            A_candidates = [e for e in base_cols if (e not in assigned_today) and (not _is_off(e, d))]
+            if not A_candidates:
+                break
+
+            A_chosen = None
+            B_chosen = None
+            B_rec = None
+
+            for A in A_candidates:
+                grpA = str(people_dict.get(A, {}).get("分組", "") or "")
+                pool_same = [
+                    r for r in recs10
+                    if isinstance(r, dict)
+                    and str(r.get("原員工", r.get("人員", "")) or "").strip() in people_dict
+                    and str(r.get("cover", "") or "").strip() not in ("分隊長", "代理分隊長")
+                    and str(people_dict.get(str(r.get("原員工", r.get("人員", "")) or "").strip(), {}).get("分組", "") or "") == grpA
+                ]
+                pool_other = [
+                    r for r in recs10
+                    if isinstance(r, dict)
+                    and str(r.get("原員工", r.get("人員", "")) or "").strip() in people_dict
+                    and str(r.get("cover", "") or "").strip() not in ("分隊長", "代理分隊長")
+                    and str(people_dict.get(str(r.get("原員工", r.get("人員", "")) or "").strip(), {}).get("分組", "") or "") != grpA
+                ]
+                pool = pool_same if pool_same else pool_other
+                if not pool:
+                    continue
+
+                # Priority: next-day outbound off, then next-day outbound pulled
+                def _pri_key(rec: dict):
+                    emp = str(rec.get("原員工", rec.get("人員", "")) or "").strip()
+                    off_next, pulled_next = _next_day_outbound_info(emp, d)
+                    if off_next:
+                        return 0
+                    if pulled_next:
+                        return 1
+                    return 2
+
+                pool_sorted = sorted(pool, key=_pri_key)
+                B_rec = pool_sorted[0]
+                B_chosen = str(B_rec.get("原員工", B_rec.get("人員", "")) or "").strip()
+                if B_chosen:
+                    A_chosen = A
+                    break
+
+            if not A_chosen or not B_chosen or B_rec is None:
+                break
+
+            # remove B from 入境10
+            try:
+                recs10.remove(B_rec)
+            except Exception:
+                pass
+
+            # adjust B old counts
+            if bool(B_rec.get("拉班", False)):
+                try:
+                    people_dict[B_chosen]["拉班次數"] = max(0, int(people_dict[B_chosen].get("拉班次數", 0) or 0) - 1)
+                except Exception:
+                    pass
+            old_cover = str(B_rec.get("cover", "") or "").strip()
+            if old_cover not in ("", "填補", "分隊長", "代理分隊長"):
+                fairness = people_dict.get(B_chosen, {}).get("公平性分數", {})
+                if isinstance(fairness, dict):
+                    try:
+                        fairness[old_cover] = max(0, int(fairness.get(old_cover, 0) or 0) - 1)
+                    except Exception:
+                        pass
+                    people_dict[B_chosen]["公平性分數"] = fairness
+            try:
+                counts = people_dict[B_chosen].get("班段次數", {})
+                if isinstance(counts, dict):
+                    counts["入境10"] = max(0, int(counts.get("入境10", 0) or 0) - 1)
+                    people_dict[B_chosen]["班段次數"] = counts
+            except Exception:
+                pass
+
+            # add A to 入境10
+            A_pull = _is_pull_for_shift(A_chosen, dd, "入境10")
+            recs10.append({
+                "原員工": A_chosen,
+                "人員": A_chosen,
+                "代班人": "",
+                "cover": "填補",
+                "拉班": A_pull,
+            })
+            try:
+                counts = people_dict[A_chosen].get("班段次數", {})
+                if not isinstance(counts, dict):
+                    counts = {}
+                counts["入境10"] = int(counts.get("入境10", 0) or 0) + 1
+                people_dict[A_chosen]["班段次數"] = counts
+            except Exception:
+                pass
+            if A_pull:
+                try:
+                    people_dict[A_chosen]["拉班次數"] = int(people_dict[A_chosen].get("拉班次數", 0) or 0) + 1
+                except Exception:
+                    people_dict[A_chosen]["拉班次數"] = 1
+
+            # add B to 入境11
+            B_pull = _is_pull_for_shift(B_chosen, dd, "入境11")
+            recs11.append({
+                "原員工": B_chosen,
+                "人員": B_chosen,
+                "代班人": "",
+                "cover": "填補",
+                "拉班": B_pull,
+            })
+            try:
+                counts = people_dict[B_chosen].get("班段次數", {})
+                if not isinstance(counts, dict):
+                    counts = {}
+                counts["入境11"] = int(counts.get("入境11", 0) or 0) + 1
+                people_dict[B_chosen]["班段次數"] = counts
+            except Exception:
+                pass
+            if B_pull:
+                try:
+                    people_dict[B_chosen]["拉班次數"] = int(people_dict[B_chosen].get("拉班次數", 0) or 0) + 1
+                except Exception:
+                    people_dict[B_chosen]["拉班次數"] = 1
 
 
 def _has_assignment_on_day(dd: dict, emp: str) -> bool:
@@ -1160,6 +1425,15 @@ def assign_employees_to_shift(
         except Exception:
             return 0
 
+    def _shift_count(emp: str, sh: str) -> int:
+        counts = people_dict.get(emp, {}).get("班段次數", {})
+        if not isinstance(counts, dict):
+            return 0
+        try:
+            return int(counts.get(sh, 0) or 0)
+        except Exception:
+            return 0
+
     def _pull_cap_threshold(pool: list[str]) -> int | None:
         """Soft cap to keep pull counts close (within +1 of current min if possible)."""
         if not pool:
@@ -1189,6 +1463,70 @@ def assign_employees_to_shift(
                 if cv in ("補入", "值日"):
                     return True
         return False
+
+    # -------------------------
+    # Rule / Scorer pipeline (order = priority)
+    # -------------------------
+    def _rule_in11_no_out_early(eligible: list[str], ctx: dict) -> list[str]:
+        if ctx.get("shift_name") != "入境11":
+            return eligible
+        return [e for e in eligible if not _violates_in11_out_early(e, d, people_dict)]
+
+    def _sc_pull_over_cap(emp: str, ctx: dict) -> int:
+        cap = ctx.get("cap")
+        if cap is None:
+            return 0
+        return 1 if _pull_count(emp) > cap else 0
+
+    def _sc_pull_count(emp: str, ctx: dict) -> int:
+        return _pull_count(emp)
+
+    def _sc_fairness(emp: str, ctx: dict) -> int:
+        sk = ctx.get("target_skill", "")
+        return _fairness(emp, sk) if sk else 0
+
+    def _sc_inbound_prev_day_pref(emp: str, ctx: dict) -> int:
+        if ctx.get("shift_name") != "出境8":
+            return 0
+        return 0 if _had_inbound_cover_prev_day(emp) else 1
+
+    def _sc_shift_count(emp: str, ctx: dict) -> int:
+        sh = ctx.get("shift_name", "")
+        return _shift_count(emp, sh)
+
+    def _apply_rules(eligible: list[str], rules: list, ctx: dict) -> list[str]:
+        pool = eligible
+        for rule in rules:
+            pool = rule(pool, ctx)
+            if not pool:
+                break
+        return pool
+
+    def _score_tuple(emp: str, scorers: list, ctx: dict) -> tuple:
+        return tuple(s(emp, ctx) for s in scorers)
+
+    RULES_BASE = [_rule_in11_no_out_early]
+    RULES_BY_TEAM = {
+        "A": RULES_BASE,
+        "B": RULES_BASE,
+    }
+    # Team-specific scorer priority (order = priority)
+    TEAM_SCORERS_PULL = {
+        "A": [_sc_pull_over_cap, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
+        "B": [_sc_pull_over_cap, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
+        "C": [_sc_pull_over_cap, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
+    }
+    TEAM_SCORERS_NONPULL = {
+        # A/B: fairness before shift count
+        "A": [_sc_fairness, _sc_shift_count, _sc_inbound_prev_day_pref],
+        "B": [_sc_fairness, _sc_shift_count, _sc_inbound_prev_day_pref],
+        # C: shift count before fairness
+        "C": [_sc_shift_count, _sc_fairness, _sc_inbound_prev_day_pref],
+    }
+    TEAM_PIPELINE = {
+        "A": ["prepare", "rules", "scorers"],
+        "B": ["prepare", "rules", "scorers"],
+    }
 
     remaining_skills = req_skills.copy()
 
@@ -1353,32 +1691,16 @@ def assign_employees_to_shift(
         if not pick_pool:
             return False
 
-        # 選人：同分隨機；若是拉班來源，必須優先拉班次數最低
+        # 選人：使用標準化 scoring pipeline（順序可調）
         if same_team:
-            chosen_emp = random.choice(pick_pool)
+            chosen_emp = _run_pipeline(Needed_Team, pick_pool, missing_sk, False)
             is_pull = False
         else:
-            cap = _pull_cap_threshold(pick_pool)
-            if cap is None:
-                if shift_name == "出境8":
-                    scores = {e: (_pull_count(e), 0 if _had_inbound_cover_prev_day(e) else 1) for e in pick_pool}
-                else:
-                    scores = {e: _pull_count(e) for e in pick_pool}
-                mn = min(scores.values())
-                best = [e for e, sc in scores.items() if sc == mn]
-                chosen_emp = random.choice(best)
-            else:
-                # Prefer those within (min + 1) to keep pulls tight; only exceed if forced.
-                within = [e for e in pick_pool if _pull_count(e) <= cap]
-                pool2 = within if within else pick_pool
-                if shift_name == "出境8":
-                    scores = {e: (_pull_count(e), 0 if _had_inbound_cover_prev_day(e) else 1) for e in pool2}
-                else:
-                    scores = {e: _pull_count(e) for e in pool2}
-                mn = min(scores.values())
-                best = [e for e, sc in scores.items() if sc == mn]
-                chosen_emp = random.choice(best)
+            other_team = _other_team(Needed_Team)
+            chosen_emp = _run_pipeline(other_team, pick_pool, missing_sk, True)
             is_pull = True
+        if chosen_emp is None:
+            return False
 
         # 把被替換的人退回 cand（讓他之後其他班段仍可用）
         replaced_emp = _emp_from_rec(rec_to_replace)
@@ -1410,6 +1732,16 @@ def assign_employees_to_shift(
             "拉班": is_pull,
         })
 
+        # 班段次數更新
+        try:
+            counts = people_dict[chosen_emp].get("班段次數", {})
+            if not isinstance(counts, dict):
+                counts = {}
+            counts[shift_name] = int(counts.get(shift_name, 0) or 0) + 1
+            people_dict[chosen_emp]["班段次數"] = counts
+        except Exception:
+            pass
+
         # 若為跨組拉班，拉班次數一定要 +1
         if is_pull:
             try:
@@ -1427,6 +1759,89 @@ def assign_employees_to_shift(
 
     def _has_skill(emp: str, sk: str) -> bool:
         return sk in _skills_for_today(emp)
+
+    def _choose_by_scoring(eligible: list[str], is_pull_round: bool, target_skill: str, team_to_use: str) -> str | None:
+        if not eligible:
+            return None
+        ctx = {
+            "shift_name": shift_name,
+            "target_skill": target_skill,
+            "is_pull_round": is_pull_round,
+            "cap": _pull_cap_threshold(eligible) if is_pull_round else None,
+            "team_to_use": team_to_use,
+        }
+        if is_pull_round:
+            scorers = TEAM_SCORERS_PULL.get(team_to_use, TEAM_SCORERS_PULL["A"])
+        else:
+            if TEAM_SCORERS_NONPULL_OVERRIDE:
+                order = TEAM_SCORERS_NONPULL_OVERRIDE.get(team_to_use, TEAM_SCORERS_NONPULL_OVERRIDE.get("A", []))
+                order = order or ["fairness", "shift_count"]
+                mapping = {
+                    "fairness": _sc_fairness,
+                    "shift_count": _sc_shift_count,
+                }
+                scorers = [mapping.get(k, _sc_fairness) for k in order] + [_sc_inbound_prev_day_pref]
+            else:
+                scorers = TEAM_SCORERS_NONPULL.get(team_to_use, TEAM_SCORERS_NONPULL["A"])
+        scores = {emp: _score_tuple(emp, scorers, ctx) for emp in eligible}
+        min_score = min(scores.values())
+        best = [emp for emp, sc in scores.items() if sc == min_score]
+        return random.choice(best)
+
+    def _mod_prepare(ctx: dict) -> list[str]:
+        team_ok = ctx.get("team_ok", []) or []
+        target_skill = ctx.get("target_skill", "")
+        is_pull_round = bool(ctx.get("is_pull_round", False))
+        if target_skill:
+            if is_pull_round:
+                return team_ok[:]
+            return [emp for emp in team_ok if _has_skill(emp, target_skill)]
+        return team_ok[:]
+
+    def _mod_rules(ctx: dict, eligible: list[str]) -> list[str]:
+        rules = RULES_BY_TEAM.get(ctx.get("team_to_use", ""), RULES_BASE)
+        return _apply_rules(eligible, rules, {"shift_name": shift_name})
+
+    def _mod_scorers(ctx: dict, eligible: list[str]) -> str | None:
+        return _choose_by_scoring(
+            eligible,
+            bool(ctx.get("is_pull_round", False)),
+            ctx.get("target_skill", ""),
+            ctx.get("team_to_use", ""),
+        )
+
+    PIPELINE_MODULES = {
+        "prepare": _mod_prepare,
+        "rules": _mod_rules,
+        "scorers": _mod_scorers,
+    }
+
+    def _run_pipeline(team_to_use: str, team_ok: list[str], target_skill: str, is_pull_round: bool) -> str | None:
+        if TEAM_PIPELINE_OVERRIDE:
+            pipeline = TEAM_PIPELINE_OVERRIDE.get(team_to_use, TEAM_PIPELINE_OVERRIDE.get("A", ["prepare", "rules", "scorers"]))
+        else:
+            pipeline = TEAM_PIPELINE.get(team_to_use, ["prepare", "rules", "scorers"])
+        ctx = {
+            "team_to_use": team_to_use,
+            "team_ok": team_ok,
+            "target_skill": target_skill,
+            "is_pull_round": is_pull_round,
+        }
+        eligible: list[str] = team_ok[:]
+        chosen: str | None = None
+        for name in pipeline:
+            mod = PIPELINE_MODULES.get(name)
+            if not mod:
+                continue
+            if name == "prepare":
+                eligible = mod(ctx)
+            elif name == "rules":
+                eligible = mod(ctx, eligible)
+            elif name == "scorers":
+                chosen = mod(ctx, eligible)
+            if name != "scorers" and not eligible:
+                return None
+        return chosen
 
 
     # 單輪執行（team_to_use / 是否拉班輪）
@@ -1446,49 +1861,9 @@ def assign_employees_to_shift(
                 viable = [sk for sk in remaining_skills if counts.get(sk, 0) > 0]
                 if viable:
                     target_skill = min(viable, key=lambda s: counts.get(s, 0))
-                    # 重要：拉班輪先不因技能限縮 eligible，避免拉班永遠落在同一批人
-                    eligible = team_ok[:] if is_pull_round else [emp for emp in team_ok if _has_skill(emp, target_skill)]
-                else:
-                    eligible = team_ok[:]
-            else:
-                eligible = team_ok[:]
-                        # Hard rule (cannot be bypassed): 入境11 cannot be followed by next-day 出境5/6
-                        
-            if shift_name == "入境11":
-                eligible = [e for e in eligible if not _violates_in11_out_early(e, d, people_dict)]
-                
-            if not eligible:
+            chosen = _run_pipeline(team_to_use, team_ok, target_skill, is_pull_round)
+            if chosen is None:
                 break
-
-            # 打分選人
-            # - 拉班輪：先看拉班次數，再看技能公平性（若有 target_skill）
-            # - 非拉班：只看技能公平性（沒 target_skill 則 0，同分隨機）
-            def _score(emp: str):
-                # 拉班輪：只看拉班次數（越少越先被拉），同分再隨機
-                if is_pull_round:
-                    cap = _pull_cap_threshold(eligible)
-                    if cap is None:
-                        if shift_name == "出境8":
-                            return (_pull_count(emp), 0 if _had_inbound_cover_prev_day(emp) else 1)
-                        return (_pull_count(emp),)
-                    # Soft-cap: avoid going above (min + 1) when possible
-                    over = 1 if _pull_count(emp) > cap else 0
-                    if shift_name == "出境8":
-                        return (over, _pull_count(emp), 0 if _had_inbound_cover_prev_day(emp) else 1)
-                    return (over, _pull_count(emp))
-
-                # 非拉班輪：維持原本的技能公平性排序（同分再隨機）
-                if shift_name == "出境8":
-                    return (
-                        _fairness(emp, target_skill) if target_skill else 0,
-                        0 if _had_inbound_cover_prev_day(emp) else 1,
-                    )
-                return (_fairness(emp, target_skill) if target_skill else 0,)
-
-            scores = {emp: _score(emp) for emp in eligible}
-            min_score = min(scores.values())
-            best = [emp for emp, sc in scores.items() if sc == min_score]
-            chosen = random.choice(best)
 
             # 代班顯示規則：
             # - 班段紀錄的「原員工」永遠是 chosen（請代班者 / 被排入該班段者）
@@ -1507,6 +1882,16 @@ def assign_employees_to_shift(
                 "cover": cover_role,
                 "拉班": is_pull_round,
             })
+
+            # 班段次數更新
+            try:
+                counts = people_dict[chosen].get("班段次數", {})
+                if not isinstance(counts, dict):
+                    counts = {}
+                counts[shift_name] = int(counts.get(shift_name, 0) or 0) + 1
+                people_dict[chosen]["班段次數"] = counts
+            except Exception:
+                pass
 
             # 公平性分數：只對本次真正覆蓋的技能 +1
             if cover_role != "填補":
@@ -1528,6 +1913,56 @@ def assign_employees_to_shift(
                     people_dict[chosen]["拉班次數"] = 1
 
             # 從候選移除（移除 chosen 本人）
+            if chosen in cand_clean:
+                cand_clean.remove(chosen)
+            if chosen in cand:
+                cand.remove(chosen)
+
+            added += 1
+
+        return added
+
+    def _run_round_any(slots: int) -> int:
+        """Rescue round: pull from any remaining candidates to fill empty slots."""
+        nonlocal cand_clean, remaining_skills
+        added = 0
+        for _ in range(slots):
+            team_ok = cand_clean[:]
+            if not team_ok:
+                break
+            # no skill targeting in rescue round
+            chosen = _run_pipeline("A", team_ok, "", True)
+            if chosen is None:
+                break
+            sub_name = ""
+            helper_name = _get_sub_helper(chosen)
+            if helper_name is not None:
+                sub_name = str(helper_name).strip()
+
+            day_dict["班段"][shift_name].append({
+                "原員工": chosen,
+                "人員": chosen,
+                "代班人": sub_name,
+                "cover": "填補",
+                "拉班": True,
+            })
+
+            # 班段次數更新
+            try:
+                counts = people_dict[chosen].get("班段次數", {})
+                if not isinstance(counts, dict):
+                    counts = {}
+                counts[shift_name] = int(counts.get(shift_name, 0) or 0) + 1
+                people_dict[chosen]["班段次數"] = counts
+            except Exception:
+                pass
+
+            # 拉班次數更新
+            try:
+                people_dict[chosen]["拉班次數"] = int(people_dict[chosen].get("拉班次數", 0) or 0) + 1
+            except Exception:
+                people_dict[chosen]["拉班次數"] = 1
+
             if chosen in cand_clean:
                 cand_clean.remove(chosen)
             if chosen in cand:
@@ -1561,6 +1996,11 @@ def assign_employees_to_shift(
         other = _other_team(Needed_Team)
         if other:
             _run_round(other, remaining_slots, is_pull_round=True)
+
+    # ===== Round 3：救援拉班（全組別，直到補滿或人用完）=====
+    remaining_slots = need_n - len(day_dict["班段"][shift_name])
+    if remaining_slots > 0 and RESCUE_FILL_ALL:
+        _run_round_any(remaining_slots)
 
     # ===== Step 2：班段內重新分配 cover，盡量用現有人員完成技能覆蓋 =====
     _rebalance_covers_within_shift()
@@ -1764,6 +2204,16 @@ def reserve_leader_for_mandatory_shifts(
     fairness[fairness_key] = int(fairness.get(fairness_key, 0) or 0) + 1
     people_dict[leader_emp]["公平性分數"] = fairness
 
+    # 4.1) 更新班段次數
+    try:
+        counts = people_dict[leader_emp].get("班段次數", {})
+        if not isinstance(counts, dict):
+            counts = {}
+        counts[must_shift] = int(counts.get(must_shift, 0) or 0) + 1
+        people_dict[leader_emp]["班段次數"] = counts
+    except Exception:
+        pass
+
     # 5) 從 cand 移除
     if leader_emp in cand:
         cand.remove(leader_emp)
@@ -1886,6 +2336,31 @@ def _fairness_sum_std_ab(people_dict: dict) -> float:
         return 0.0
     return float(statistics.pstdev(vals))
 
+
+def _shift_count_std_ab(people_dict: dict) -> float:
+    """Sum of std devs across shifts for A/B employees (lower is better)."""
+    total = 0.0
+    for sh in SHIFT_ORDER:
+        vals: list[int] = []
+        for _, info in (people_dict or {}).items():
+            if not isinstance(info, dict):
+                continue
+            grp = str(info.get("分組", "") or "").strip().upper()
+            if grp not in ("A", "B"):
+                continue
+            counts = info.get("班段次數", {})
+            if not isinstance(counts, dict):
+                vals.append(0)
+                continue
+            try:
+                vals.append(int(counts.get(sh, 0) or 0))
+            except Exception:
+                vals.append(0)
+        if len(vals) <= 1:
+            continue
+        total += float(statistics.pstdev(vals))
+    return total
+
 # New helper: check all A/B 拉班次數 >= 1
 def _all_pulls_nonzero_ab(people_dict: dict) -> bool:
     """Return True only if every A/B employee has pull-count >= 1."""
@@ -1912,10 +2387,6 @@ def _needed_team_for_shift(dd: dict, shift_name: str) -> str:
     - 入境11：用早班的另一組
     - 其他：用早班
 
-    若開啟 SMART_TEAM_PICK：
-    - 以『當下 dd["_cand"]』的 A/B 人數，判斷 preferred 是否足以 cover 本班段剩餘需求。
-    - preferred 不夠但另一組夠：直接換組（避免必拉）。
-    - 兩組都不夠：選人比較多的那組（把拉班量壓到最小）。
     """
 
     base = dd.get("早班", "")
@@ -1926,40 +2397,6 @@ def _needed_team_for_shift(dd: dict, shift_name: str) -> str:
 
     # 1) your original rule -> preferred
     preferred = other if shift_name in ("出境5", "出境6", "入境11") else base
-
-    if not SMART_TEAM_PICK:
-        return preferred
-
-    # 2) remaining demand for this shift (subtract any pre-seeded assignments like leader)
-    try:
-        demand_total = int(shift_demands.get(shift_name, 0) or 0)
-    except Exception:
-        demand_total = 0
-    already = len(dd.get("班段", {}).get(shift_name, []) or [])
-    need = max(0, demand_total - already)
-
-    cand_now = dd.get("_cand", []) or []
-    if need <= 0 or not cand_now:
-        return preferred
-
-    def _count(team: str) -> int:
-        return sum(1 for e in cand_now if people_dict.get(e, {}).get("分組", "") == team)
-
-    cnt_pref = _count(preferred)
-    cnt_other = _count(other)
-
-    # 3) prefer the team that can cover without forcing a pull
-    if cnt_pref < need and cnt_other >= need:
-        if DEBUG_SCHED:
-            _debug(f"[TEAM ] day {dd.get('日期')} {shift_name}: switch {preferred}->{other} (need={need}, pref={cnt_pref}, other={cnt_other})")
-        return other
-
-    # 4) both short -> pick the larger pool to minimize pull volume
-    if cnt_pref < need and cnt_other < need:
-        chosen = preferred if cnt_pref >= cnt_other else other
-        if DEBUG_SCHED and chosen != preferred:
-            _debug(f"[TEAM ] day {dd.get('日期')} {shift_name}: both short, pick {chosen} (need={need}, pref={cnt_pref}, other={cnt_other})")
-        return chosen
 
     return preferred
 

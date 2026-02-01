@@ -32,17 +32,13 @@ def _store_result(
     out_path: Path,
     tmpdir: Path,
     tries: int,
-    best_score: float,
-    best_pull_std: float,
-    best_fair_std: float,
+    best_score_100: float,
 ) -> None:
     _RESULTS[token] = {
         "out_path": out_path,
         "tmpdir": tmpdir,
         "tries": tries,
-        "best_std": best_score,
-        "best_pull_std": best_pull_std,
-        "best_fair_std": best_fair_std,
+        "best_score_100": best_score_100,
         "ts": time.time(),
         "status": "done",
         "progress": 1.0,
@@ -135,14 +131,64 @@ def home():
           </p>
 
           <p>
-            Min tries:
-            <input type="range" name="min_tries" value="100" min="100" max="5000" step="10"
-                   oninput="document.getElementById('minTriesVal').textContent=this.value" />
-            <span id="minTriesVal">100</span>
+            優先次序:
+            <select name="priority_mode" id="priorityMode">
+              <option value="team1">一分隊</option>
+              <option value="team2">二分隊</option>
+              <option value="team3">三分隊</option>
+              <option value="custom">客製化</option>
+            </select>
           </p>
+
+          <div id="customWrap" style="display: none; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
+            <div style="margin-bottom: 6px;">自訂模組優先順序（由上到下）</div>
+            <ul id="customList" style="list-style: none; padding: 0; margin: 0;">
+              <li data-key="fairness" style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+                <span style="width: 140px;">職務次數平均</span>
+                <button type="button" class="upBtn">↑</button>
+                <button type="button" class="downBtn">↓</button>
+              </li>
+              <li data-key="shift_count" style="display: flex; align-items: center; gap: 8px;">
+                <span style="width: 140px;">班段次數平均</span>
+                <button type="button" class="upBtn">↑</button>
+                <button type="button" class="downBtn">↓</button>
+              </li>
+            </ul>
+          </div>
+
+          <input type="hidden" name="custom_order" id="customOrder" value="fairness,shift_count" />
 
           <button type="submit">Run</button>
         </form>
+        <script>
+          const modeSel = document.getElementById('priorityMode');
+          const customWrap = document.getElementById('customWrap');
+          const customList = document.getElementById('customList');
+          const customOrder = document.getElementById('customOrder');
+
+          function syncOrder() {
+            const keys = Array.from(customList.querySelectorAll('li')).map(li => li.dataset.key);
+            customOrder.value = keys.join(',');
+          }
+
+          modeSel.addEventListener('change', () => {
+            customWrap.style.display = (modeSel.value === 'custom') ? 'block' : 'none';
+          });
+
+          customList.addEventListener('click', (e) => {
+            if (!(e.target instanceof HTMLButtonElement)) return;
+            const li = e.target.closest('li');
+            if (!li) return;
+            if (e.target.classList.contains('upBtn')) {
+              const prev = li.previousElementSibling;
+              if (prev) customList.insertBefore(li, prev);
+            } else if (e.target.classList.contains('downBtn')) {
+              const next = li.nextElementSibling;
+              if (next) customList.insertBefore(next, li);
+            }
+            syncOrder();
+          });
+        </script>
       </body>
     </html>
     """
@@ -152,7 +198,8 @@ def home():
 async def run(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    min_tries: int = Form(100),
+    priority_mode: str = Form("team1"),
+    custom_order: str = Form("fairness,shift_count"),
 ):
     # 1) 基本檢查：副檔名
     filename = (file.filename or "").lower()
@@ -177,8 +224,7 @@ async def run(
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
         token = uuid.uuid4().hex
-        min_tries_val = max(100, int(min_tries))
-        _init_progress(token, tmpdir, min_tries_val)
+        _init_progress(token, tmpdir, 100)
 
         def _run_job() -> None:
             try:
@@ -189,18 +235,18 @@ async def run(
                     input_excel_path=str(in_path),
                     output_excel_path=str(out_path),
                     search_best_roster=True,
-                    search_min_tries=min_tries_val,
                     search_patience=10,
                     require_all_pulls_nonzero=False,
                     debug=False,
                     progress_callback=_cb,
+                    priority_mode=priority_mode,
+                    custom_order=custom_order,
+                    rescue_fill=True,
                 )
 
                 tries_used = int(result.get("tries", 0) or 0)
-                best_score = float(result.get("best_std", 0.0) or 0.0)
-                best_pull_std = float(result.get("best_pull_std", 0.0) or 0.0)
-                best_fair_std = float(result.get("best_fair_std", 0.0) or 0.0)
-                _store_result(token, out_path, tmpdir, tries_used, best_score, best_pull_std, best_fair_std)
+                best_score = float(result.get("best_score_100", 0.0) or 0.0)
+                _store_result(token, out_path, tmpdir, tries_used, best_score)
             except Exception as e:
                 _set_error(token, str(e))
 
@@ -243,7 +289,7 @@ async def run(
                     }}
                     txt.textContent = 'Try ' + (data.tries || 0) + ' / ' + (data.max_tries || 5000) + etaText;
                     if (data.status === 'done') {{
-                      window.location.href = '/result/{token}';
+                      window.location.href = '/preview/{token}';
                       return;
                     }}
                     setTimeout(poll, 500);
@@ -305,44 +351,6 @@ def progress(token: str):
             "eta_sec": eta_sec,
             "message": data.get("message", ""),
         }
-    )
-
-
-@app.get("/result/{token}", response_class=HTMLResponse)
-def result_page(token: str):
-    data = _get_result(token)
-    if not data:
-        raise HTTPException(status_code=404, detail="Result expired or not found.")
-    if data.get("status") != "done":
-        raise HTTPException(status_code=400, detail="Result not ready.")
-
-    tries_used = int(data.get("tries", 0) or 0)
-    best_score = float(data.get("best_std", 0.0) or 0.0)
-    best_pull_std = float(data.get("best_pull_std", 0.0) or 0.0)
-    best_fair_std = float(data.get("best_fair_std", 0.0) or 0.0)
-
-    return HTMLResponse(
-        f"""
-        <html>
-          <head>
-            <meta charset="utf-8" />
-            <title>Airport Scheduler</title>
-          </head>
-          <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-            <h2>完成</h2>
-            <p>Tries: {tries_used}</p>
-            <p>Best score (pull std + fairness std): {best_score:.4f}</p>
-            <p>Pull std: {best_pull_std:.4f}</p>
-            <p>Fairness std: {best_fair_std:.4f}</p>
-            <p><a href="/download/{token}">下載結果 Excel</a></p>
-            <p><a href="/preview/{token}">預覽結果（含顏色）</a></p>
-            <div style="border: 1px solid #ddd; padding: 12px; overflow: auto;">
-              <iframe src="/preview/{token}" style="width: 100%; height: 520px; border: 0;"></iframe>
-            </div>
-            <p><a href="/">回首頁</a></p>
-          </body>
-        </html>
-        """
     )
 
 
