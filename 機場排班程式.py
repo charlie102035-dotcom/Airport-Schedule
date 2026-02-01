@@ -165,6 +165,7 @@ def run_scheduler(
     priority_mode: str = "team1",
     custom_order: str = "fairness,shift_count",
     rescue_fill: bool = True,
+    score_order: str = "fairness,shift,pull",
 ) -> dict:
     """Run scheduler from an uploaded Excel and export an output Excel.
 
@@ -239,6 +240,11 @@ def run_scheduler(
             "B": ["fairness", "shift_count"],
             "C": ["fairness", "shift_count"],
         }
+
+    # Global score priority order (weights 3,2,1)
+    score_order_list = [s.strip() for s in str(score_order or "").split(",") if s.strip()]
+    if len(score_order_list) != 3:
+        score_order_list = ["fairness", "shift", "pull"]
 
     if days_limit is not None:
         DAYS_LIMIT = int(days_limit)
@@ -712,7 +718,12 @@ def run_scheduler(
             pull_std = _pull_std_ab(people_dict)
             fair_std = _fairness_sum_std_ab(people_dict)
             shift_std = _shift_count_std_ab(people_dict)
-            score = -(pull_std + fair_std + shift_std)
+            std_map = {"pull": pull_std, "fairness": fair_std, "shift": shift_std}
+            weights = [3, 2, 1]
+            weighted_sum = 0.0
+            for w, k in zip(weights, score_order_list):
+                weighted_sum += float(std_map.get(k, 0.0)) * w
+            score = -(weighted_sum)
 
             has_empty = _violates_no_empty_on_workday(daily_list, employee_cols, people_dict)
             if not has_empty:
@@ -776,7 +787,12 @@ def run_scheduler(
         best_pull_std = _pull_std_ab(people_dict)
         best_fair_std = _fairness_sum_std_ab(people_dict)
         best_shift_std = _shift_count_std_ab(people_dict)
-        best_score = -(best_pull_std + best_fair_std + best_shift_std)
+        std_map = {"pull": best_pull_std, "fairness": best_fair_std, "shift": best_shift_std}
+        weights = [3, 2, 1]
+        weighted_sum = 0.0
+        for w, k in zip(weights, score_order_list):
+            weighted_sum += float(std_map.get(k, 0.0)) * w
+        best_score = -(weighted_sum)
 
     # -------------------------
     # Build output df + export to Excel
@@ -867,10 +883,95 @@ def run_scheduler(
 
         ws.row_dimensions[1].height = 22
 
+        # Set all columns to the same width (max width as baseline)
+        max_width = 0
+        for col in range(1, max_col + 1):
+            letter = get_column_letter(col)
+            w = ws.column_dimensions[letter].width or 10
+            if w > max_width:
+                max_width = w
+        if max_width <= 0:
+            max_width = 12
+        for col in range(1, max_col + 1):
+            letter = get_column_letter(col)
+            ws.column_dimensions[letter].width = max_width
+
     # Normalize score to 0-100 (higher is better)
-    raw_total = float(best_pull_std + best_fair_std + best_shift_std)
+    std_map = {"pull": best_pull_std, "fairness": best_fair_std, "shift": best_shift_std}
+    weights = [3, 2, 1]
+    raw_total = 0.0
+    for w, k in zip(weights, score_order_list):
+        raw_total += float(std_map.get(k, 0.0)) * w
     norm = raw_total / (raw_total + 1.0) if raw_total >= 0 else 1.0
     best_score_100 = max(0.0, min(100.0, (1.0 - norm) * 100.0))
+
+    # Build chart data for A/B shift counts
+    chart_data: dict = {"shift": {}, "skill": {}, "pull": {}}
+    shift_order = ["入境10", "入境11", "出境5", "出境6", "出境7", "出境8"]
+    for sh in shift_order:
+        a_list = []
+        b_list = []
+        for emp in employee_cols:
+            info = people_dict.get(emp, {})
+            grp = str(info.get("分組", "") or "")
+            counts = info.get("班段次數", {})
+            if not isinstance(counts, dict):
+                continue
+            c = int(counts.get(sh, 0) or 0)
+            if grp == "A":
+                a_list.append((emp, c))
+            elif grp == "B":
+                b_list.append((emp, c))
+        a_list.sort(key=lambda x: x[1], reverse=True)
+        b_list.sort(key=lambda x: x[1], reverse=True)
+        chart_data["shift"][sh] = {"A": a_list, "B": b_list}
+
+    # Skill/role charts (only count employees who have that skill)
+    skill_names = set()
+    for emp in employee_cols:
+        info = people_dict.get(emp, {})
+        skills = info.get("職能", {}) or {}
+        if isinstance(skills, dict):
+            for sk in skills.keys():
+                skill_names.add(str(sk))
+    skip_skills = {"分隊長", "代理分隊長"}
+    for sk in sorted(skill_names):
+        if sk in skip_skills:
+            continue
+        a_list = []
+        b_list = []
+        for emp in employee_cols:
+            info = people_dict.get(emp, {})
+            grp = str(info.get("分組", "") or "")
+            skills = info.get("職能", {}) or {}
+            if not isinstance(skills, dict) or sk not in skills:
+                continue
+            fairness = info.get("公平性分數", {}) or {}
+            if not isinstance(fairness, dict):
+                continue
+            c = int(fairness.get(sk, 0) or 0)
+            if grp == "A":
+                a_list.append((emp, c))
+            elif grp == "B":
+                b_list.append((emp, c))
+        a_list.sort(key=lambda x: x[1], reverse=True)
+        b_list.sort(key=lambda x: x[1], reverse=True)
+        chart_data["skill"][sk] = {"A": a_list, "B": b_list}
+
+    # Pull count chart (A/B)
+    a_list = []
+    b_list = []
+    for emp in employee_cols:
+        info = people_dict.get(emp, {})
+        grp = str(info.get("分組", "") or "")
+        c = int(info.get("拉班次數", 0) or 0)
+        if grp == "A":
+            a_list.append((emp, c))
+        elif grp == "B":
+            b_list.append((emp, c))
+    a_list.sort(key=lambda x: x[1], reverse=True)
+    b_list.sort(key=lambda x: x[1], reverse=True)
+    chart_data["pull"]["拉班次數"] = {"A": a_list, "B": b_list}
 
     return {
         "output_path": out_path,
@@ -880,6 +981,7 @@ def run_scheduler(
         "best_fair_std": float(best_fair_std),
         "best_shift_std": float(best_shift_std),
         "best_score_100": float(best_score_100),
+        "chart_data": chart_data,
         "best_is_bad": bool(best_is_bad),
         "used_search": bool(used_search),
     }
