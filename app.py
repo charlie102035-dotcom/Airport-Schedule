@@ -481,6 +481,7 @@ def preview(token: str):
             if cell.font and cell.font.bold:
                 styles.append("font-weight: 700;")
             styles.append(f"width:{col_pct:.3f}%")
+            styles.append("min-width:90px")
             style_attr = f' style="{" ".join(styles)}"'
             tag = "th" if r == 1 else "td"
             cells.append(f"<{tag}{style_attr}>{val}</{tag}>")
