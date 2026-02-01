@@ -287,7 +287,7 @@ async def run(
                       const ss = total % 60;
                       etaText = ' | ETA ' + mm + 'm ' + ss + 's';
                     }}
-                    txt.textContent = 'Try ' + (data.tries || 0) + ' / ' + (data.max_tries || 5000) + etaText;
+                    txt.textContent = 'Progress ' + pct + '%'+ etaText;
                     if (data.status === 'done') {{
                       window.location.href = '/preview/{token}';
                       return;
