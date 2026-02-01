@@ -141,10 +141,9 @@ def run_scheduler(
     input_excel_path: str,
     output_excel_path: str | None = None,
     *,
-    days_limit: int = 28,
+    days_limit: int | None = None,
     include_external: bool = False,
     search_best_roster: bool = True,
-    search_max_tries: int = 5000,
     search_min_tries: int = 100,
     search_patience: int = 10,
     require_all_pulls_nonzero: bool = True,
@@ -184,13 +183,14 @@ def run_scheduler(
     SMART_TEAM_PICK = bool(smart_team_pick)
 
     SEARCH_BEST_ROSTER = bool(search_best_roster)
-    SEARCH_MAX_TRIES = int(search_max_tries)
     SEARCH_MIN_TRIES = int(search_min_tries)
+    SEARCH_MAX_TRIES = int(search_min_tries)
     SEARCH_PATIENCE = int(search_patience)
 
-    DAYS_LIMIT = int(days_limit)
-    if DAYS_LIMIT < 1:
-        raise ValueError("days_limit must be >= 1")
+    if days_limit is not None:
+        DAYS_LIMIT = int(days_limit)
+        if DAYS_LIMIT < 1:
+            raise ValueError("days_limit must be >= 1")
 
     if random_seed is not None:
         try:
@@ -527,8 +527,45 @@ def run_scheduler(
         TeamChoices.remove(First_part_starting_team)
     AnotherChoice = str(TeamChoices[0]) if TeamChoices else ""
 
-    days: dict[int, dict] = {}
+    # Determine scheduling window:
+    # start from first 入境 day; end at last 出境 day in the last part.
+    day_type_by_day: dict[int, str] = {}
+    part_by_day: dict[int, int] = {}
+    part_idx = 0
     for d in all_days:
+        works = base.loc[base["日期"] == int(d), "工作"].tolist()
+        day_type = _infer_day_type(works)
+        day_type_by_day[int(d)] = day_type
+        part_by_day[int(d)] = part_idx
+        if day_type == "輪休":
+            part_idx += 1
+
+    start_day = None
+    for d in all_days:
+        if day_type_by_day.get(int(d)) == "入境":
+            start_day = int(d)
+            break
+    if start_day is None and all_days:
+        start_day = int(all_days[0])
+
+    last_part = max(part_by_day.values()) if part_by_day else 0
+    end_day = None
+    for d in reversed(all_days):
+        if part_by_day.get(int(d)) == last_part and day_type_by_day.get(int(d)) == "出境":
+            end_day = int(d)
+            break
+    if end_day is None and all_days:
+        for d in reversed(all_days):
+            if part_by_day.get(int(d)) == last_part:
+                end_day = int(d)
+                break
+
+    schedule_days = [d for d in all_days if start_day is not None and end_day is not None and start_day <= int(d) <= end_day]
+    if not schedule_days:
+        schedule_days = all_days[:]
+
+    days: dict[int, dict] = {}
+    for d in schedule_days:
         works = base.loc[base["日期"] == int(d), "工作"].tolist()
         day_type = _infer_day_type(works)
 
@@ -551,7 +588,10 @@ def run_scheduler(
 
         days[int(d)] = day_dict
 
-    daily_list = [days[d] for d in all_days]
+    daily_list = [days[d] for d in schedule_days]
+
+    if days_limit is None:
+        DAYS_LIMIT = len(daily_list)
 
     # -------------------------
     # Run scheduling (search-best or single)
@@ -567,10 +607,9 @@ def run_scheduler(
     # If many attempts are skipped (RULE violations / pulls-nonzero constraint),
     # the loop can take a long time while making no progress. Guard with a skip streak.
     skip_streak = 0
-    max_skip_streak = max(500, int(SEARCH_PATIENCE) * 200)
 
     if search_best_roster:
-        for t in range(1, SEARCH_MAX_TRIES + 1):
+        for t in range(1, SEARCH_MIN_TRIES + 1):
             total_tries = t
             if callable(progress_callback):
                 try:
@@ -582,29 +621,19 @@ def run_scheduler(
             except ValueError as e:
                 if str(e).startswith("[RULE]"):
                     skip_streak += 1
-                    if skip_streak >= max_skip_streak:
-                        break
                     continue
                 skip_streak += 1
-                if skip_streak >= max_skip_streak:
-                    break
                 continue
             except Exception:
                 skip_streak += 1
-                if skip_streak >= max_skip_streak:
-                    break
                 continue
 
             if require_all_pulls_nonzero and not _all_pulls_nonzero_ab(people_dict):
                 skip_streak += 1
-                if skip_streak >= max_skip_streak:
-                    break
                 continue
 
             if _violates_no_empty_on_workday(daily_list, employee_cols, people_dict):
                 skip_streak += 1
-                if skip_streak >= max_skip_streak:
-                    break
                 continue
 
             # We have a valid roster attempt; reset skip streak.
@@ -624,12 +653,9 @@ def run_scheduler(
             else:
                 no_improve += 1
 
-            if best_people is not None and no_improve >= SEARCH_PATIENCE and t >= SEARCH_MIN_TRIES:
-                break
-
         if best_daily is None or best_people is None:
             raise ValueError(
-                f"[FINAL] No valid roster found within {total_tries} tries (max={SEARCH_MAX_TRIES}, skip_guard={max_skip_streak}) under constraint: all A/B 拉班次數 must be >= 1."
+                f"[FINAL] No valid roster found within {total_tries} tries (min={SEARCH_MIN_TRIES})."
             )
 
         daily_list[:DAYS_LIMIT] = best_daily

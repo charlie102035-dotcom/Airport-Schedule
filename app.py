@@ -135,11 +135,6 @@ def home():
           </p>
 
           <p>
-            Days:
-            <input type="number" name="days" value="28" min="1" max="31" />
-          </p>
-
-          <p>
             Min tries:
             <input type="range" name="min_tries" value="100" min="100" max="5000" step="10"
                    oninput="document.getElementById('minTriesVal').textContent=this.value" />
@@ -162,7 +157,6 @@ def home():
 async def run(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    days: int = Form(28),
     min_tries: int = Form(100),
     patience: int = Form(10),
 ):
@@ -200,9 +194,7 @@ async def run(
                 result = run_scheduler(
                     input_excel_path=str(in_path),
                     output_excel_path=str(out_path),
-                    days_limit=int(days),
                     search_best_roster=True,
-                    search_max_tries=5000,
                     search_min_tries=min_tries_val,
                     search_patience=int(patience),
                     require_all_pulls_nonzero=False,
@@ -296,7 +288,7 @@ def progress(token: str):
     now = time.time()
     start_ts = float(data.get("start_ts", now) or now)
     tries = int(data.get("tries", 0) or 0)
-    max_tries = int(data.get("min_tries", 5000) or 5000)
+    max_tries = int(data.get("min_tries", 100) or 100)
     eta_sec = None
     elapsed = max(0.0, now - start_ts)
     if tries > 0 and elapsed > 0.5:
