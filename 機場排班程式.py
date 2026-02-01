@@ -627,10 +627,10 @@ def run_scheduler(
 
         if day_type == "入境":
             day_dict["班段"] = {"入境10": [], "入境11": []}
-            day_dict["早班"] = First_part_starting_team if part % 2 == 1 else AnotherChoice
+            day_dict["早班"] = First_part_starting_team if part % 2 == 0 else AnotherChoice
         elif day_type == "出境":
             day_dict["班段"] = {"出境5": [], "出境6": [], "出境7": [], "出境8": []}
-            day_dict["早班"] = AnotherChoice if part % 2 == 1 else First_part_starting_team
+            day_dict["早班"] = AnotherChoice if part % 2 == 0 else First_part_starting_team
         elif day_type == "輪休":
             part += 1
             day_dict["班段"] = {}
