@@ -163,10 +163,15 @@ def home():
         <link rel="icon" href="/static/favicon.png" />
       </head>
       <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-        <h2>Upload Excel → Run → Download Excel</h2>
+        <h2>TSA班表生成器</h2>
         <p>
           <a href="https://drive.google.com/drive/folders/1mNXtRv5olbJQAGhnVy30mBoa8m4nTAJT?usp=sharing" target="_blank" rel="noopener noreferrer">
             下載模板
+          </a>
+        </p>
+        <p>
+          <a href="https://drive.google.com/file/d/1ypcRSL7oebprND6yXXhVLAe_QJ2uxFD1/view?usp=share_link" target="_blank" rel="noopener noreferrer" style="display: inline-block; padding: 6px 12px; border: 1px solid #999; border-radius: 4px; text-decoration: none; color: #111;">
+            使用說明書
           </a>
         </p>
 
@@ -177,7 +182,7 @@ def home():
           </p>
 
           <p>
-            模組:
+            套用分隊:
             <select name="priority_mode" id="priorityMode">
               <option value="team1">一分隊</option>
               <option value="team2">二分隊</option>
@@ -187,7 +192,7 @@ def home():
           </p>
 
           <div id="customWrap" style="display: none; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
-            <div style="margin-bottom: 6px;">自訂模組優先順序（由上到下）</div>
+            <div style="margin-bottom: 6px;">自訂模組啟用</div>
             <div style="display: flex; gap: 16px;">
               <div style="flex: 1;">
                 <div style="font-size: 12px; color: #666; margin-bottom: 6px;">Activated</div>
@@ -195,14 +200,10 @@ def home():
                   <li data-key="fairness" style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
                     <input type="checkbox" class="modCheck" checked />
                     <span style="width: 120px;">職務次數平均</span>
-                    <button type="button" class="upBtn">↑</button>
-                    <button type="button" class="downBtn">↓</button>
                   </li>
                   <li data-key="shift_count" style="display: flex; align-items: center; gap: 8px;">
                     <input type="checkbox" class="modCheck" checked />
                     <span style="width: 120px;">班段次數平均</span>
-                    <button type="button" class="upBtn">↑</button>
-                    <button type="button" class="downBtn">↓</button>
                   </li>
                 </ul>
               </div>
@@ -216,8 +217,8 @@ def home():
 
           <input type="hidden" name="custom_order" id="customOrder" value="fairness,shift_count" />
 
-          <div style="border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
-            <div style="margin-bottom: 6px;">全局評分優先次序（由上到下，倍率 3/2/1）</div>
+          <div id="scoreWrap" style="display: none; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
+            <div style="margin-bottom: 6px;">我們最注重......（由上到下，倍率 3/2/1）</div>
             <ul id="scoreOrderList" style="list-style: none; padding: 0; margin: 0;">
               <li data-key="fairness" style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
                 <span style="width: 140px;">職務次數平均</span>
@@ -243,6 +244,7 @@ def home():
         <script>
           const modeSel = document.getElementById('priorityMode');
           const customWrap = document.getElementById('customWrap');
+          const scoreWrap = document.getElementById('scoreWrap');
           const customList = document.getElementById('customList');
           const inactiveList = document.getElementById('inactiveList');
           const customOrder = document.getElementById('customOrder');
@@ -259,22 +261,15 @@ def home():
           }
 
           modeSel.addEventListener('change', () => {
-            customWrap.style.display = (modeSel.value === 'custom') ? 'block' : 'none';
+            const isCustom = modeSel.value === 'custom';
+            customWrap.style.display = isCustom ? 'block' : 'none';
+            scoreWrap.style.display = isCustom ? 'block' : 'none';
           });
-
-          customList.addEventListener('click', (e) => {
-            if (!(e.target instanceof HTMLButtonElement)) return;
-            const li = e.target.closest('li');
-            if (!li) return;
-            if (e.target.classList.contains('upBtn')) {
-              const prev = li.previousElementSibling;
-              if (prev) customList.insertBefore(li, prev);
-            } else if (e.target.classList.contains('downBtn')) {
-              const next = li.nextElementSibling;
-              if (next) customList.insertBefore(next, li);
-            }
-            syncOrder();
-          });
+          {
+            const isCustomInit = modeSel.value === 'custom';
+            customWrap.style.display = isCustomInit ? 'block' : 'none';
+            scoreWrap.style.display = isCustomInit ? 'block' : 'none';
+          }
 
           customWrap.addEventListener('change', (e) => {
             const target = e.target;
@@ -303,6 +298,8 @@ def home():
             }
             syncScoreOrder();
           });
+          syncOrder();
+          syncScoreOrder();
         </script>
       </body>
     </html>

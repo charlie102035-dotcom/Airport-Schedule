@@ -518,10 +518,16 @@ def run_scheduler(
     # Configure scorer priority based on mode
     priority_mode = str(priority_mode or "").strip().lower()
     order = [s.strip() for s in str(custom_order or "").split(",") if s.strip()]
-    if not order:
-        order = ["fairness", "shift_count"]
-    if order[0] == order[1] if len(order) > 1 else False:
-        order = ["fairness", "shift_count"]
+    active_set = {k for k in order if k in ("fairness", "shift_count")}
+    if not active_set:
+        active_set = {"fairness", "shift_count"}
+
+    # Global score priority order (weights 3,2,1)
+    score_order_list = [s.strip() for s in str(score_order or "").split(",") if s.strip()]
+    if len(score_order_list) != 3:
+        score_order_list = ["fairness", "shift", "pull"]
+    if priority_mode == "team1":
+        score_order_list = ["fairness", "pull", "shift"]
 
     def _make_nonpull_scorers(order_list: list[str]):
         mapping = {
@@ -531,10 +537,23 @@ def run_scheduler(
         return [mapping.get(k, "_sc_fairness") for k in order_list]
 
     if priority_mode == "custom":
+        def _nonpull_order_from_score(score_list: list[str]) -> list[str]:
+            out: list[str] = []
+            for k in score_list:
+                if k == "fairness" and "fairness" in active_set:
+                    out.append("fairness")
+                elif k == "shift" and "shift_count" in active_set:
+                    out.append("shift_count")
+            return out
+
+        custom_nonpull = _nonpull_order_from_score(score_order_list)
+        if not custom_nonpull:
+            custom_nonpull = ["fairness"] if "fairness" in active_set else ["shift_count"]
+
         TEAM_SCORERS_NONPULL_OVERRIDE = {
-            "A": order,
-            "B": order,
-            "C": order,
+            "A": custom_nonpull,
+            "B": custom_nonpull,
+            "C": custom_nonpull,
         }
     elif priority_mode == "team3":
         TEAM_SCORERS_NONPULL_OVERRIDE = {
@@ -549,11 +568,6 @@ def run_scheduler(
             "B": ["fairness", "shift_count"],
             "C": ["fairness", "shift_count"],
         }
-
-    # Global score priority order (weights 3,2,1)
-    score_order_list = [s.strip() for s in str(score_order or "").split(",") if s.strip()]
-    if len(score_order_list) != 3:
-        score_order_list = ["fairness", "shift", "pull"]
 
     if days_limit is not None:
         DAYS_LIMIT = int(days_limit)
