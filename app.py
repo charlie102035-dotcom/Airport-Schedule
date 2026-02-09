@@ -131,6 +131,11 @@ def _get_scheduler_funcs():
 
         report_path = str(Path(out_path).with_name("departure_report.txt"))
         if departure_api == "legacy":
+            if callable(progress_callback):
+                try:
+                    progress_callback(8, 100, "solve")
+                except Exception:
+                    pass
             run_fn = getattr(departure_mod, "run_departure_scheduler", None)
             if not callable(run_fn):
                 raise RuntimeError("legacy departure module 缺少 run_departure_scheduler")
@@ -156,6 +161,13 @@ def _get_scheduler_funcs():
                 "total_shortage_slots": int(result.get("total_shortage_slots", 0) or 0),
             }
 
+        if callable(progress_callback):
+            try:
+                progress_callback(4, 100, "prepare")
+                progress_callback(12, 100, "model")
+            except Exception:
+                pass
+
         settings = departure_mod.SolverSettings(
             weight_last_hour_work=50,
             weight_group_fairness=8,
@@ -175,12 +187,11 @@ def _get_scheduler_funcs():
 
         heartbeat_thread = None
         heartbeat_stop = threading.Event()
-        # hard mode may fallback to allow_shortage, so reserve roughly 2x solve budget.
-        expected_sec = max(20, int(settings.max_time_sec) * 2 + 10)
+        expected_sec = max(15, int(settings.max_time_sec) + 10)
 
         if callable(progress_callback):
             try:
-                progress_callback(1, 100)
+                progress_callback(18, 100, "solve")
             except Exception:
                 pass
 
@@ -188,9 +199,9 @@ def _get_scheduler_funcs():
                 start = time.time()
                 while not heartbeat_stop.wait(1.0):
                     elapsed = max(0.0, time.time() - start)
-                    cur = min(99, max(1, int((elapsed / expected_sec) * 100)))
+                    cur = min(92, max(18, 18 + int((elapsed / expected_sec) * 74)))
                     try:
-                        progress_callback(cur, 100)
+                        progress_callback(cur, 100, "solve")
                     except Exception:
                         return
 
@@ -213,7 +224,7 @@ def _get_scheduler_funcs():
 
         if callable(progress_callback):
             try:
-                progress_callback(100, 100)
+                progress_callback(96, 100, "export")
             except Exception:
                 pass
 
@@ -225,6 +236,11 @@ def _get_scheduler_funcs():
                 f"status={result.get('status', '')}, shortage_slots={total_shortage}。"
                 f"請查看診斷報告：{report_path}"
             )
+        if callable(progress_callback):
+            try:
+                progress_callback(100, 100, "done")
+            except Exception:
+                pass
         score = 100.0 if all_covered else max(0.0, 100.0 - float(total_shortage))
         departure_stats = _build_departure_chart_data(out_path)
         return {
@@ -270,6 +286,7 @@ def _store_result(
         "ts": time.time(),
         "status": "done",
         "progress": 1.0,
+        "phase": "done",
     }
 
 
@@ -291,6 +308,7 @@ def _esc(v) -> str:
 
 
 def _init_progress(token: str, tmpdir: Path, min_tries: int, mode: str) -> None:
+    mode_key = _mode_key_or_default(mode)
     _RESULTS[token] = {
         "tmpdir": tmpdir,
         "ts": time.time(),
@@ -299,20 +317,23 @@ def _init_progress(token: str, tmpdir: Path, min_tries: int, mode: str) -> None:
         "progress": 0.0,
         "tries": 0,
         "min_tries": int(min_tries),
-        "mode": _mode_key_or_default(mode),
+        "mode": mode_key,
+        "phase": "prepare" if mode_key == "departure" else "",
     }
 
 
-def _set_progress(token: str, current_try: int, max_tries: int) -> None:
+def _set_progress(token: str, current_try: int, max_tries: int, phase: str | None = None) -> None:
     data = _RESULTS.get(token)
     if not data:
         return
     data["ts"] = time.time()
     total = max(1, int(max_tries))
     data["min_tries"] = total
-    cur = max(0, int(current_try))
+    cur = max(int(data.get("tries", 0) or 0), max(0, int(current_try)))
     data["tries"] = cur
     data["progress"] = min(1.0, cur / total)
+    if phase is not None:
+        data["phase"] = str(phase).strip()
 
 
 def _set_error(token: str, msg: str) -> None:
@@ -321,6 +342,7 @@ def _set_error(token: str, msg: str) -> None:
         return
     data["status"] = "error"
     data["message"] = msg
+    data["phase"] = "error"
 
 
 def _format_validation_errors(errors: list[dict]) -> str:
@@ -556,8 +578,8 @@ async def run(
 
         def _run_job() -> None:
             try:
-                def _cb(cur: int, mx: int) -> None:
-                    _set_progress(token, cur, mx)
+                def _cb(cur: int, mx: int, phase: str | None = None) -> None:
+                    _set_progress(token, cur, mx, phase)
 
                 run_kwargs = mode_cfg.get("run_kwargs", {}) or {}
                 result = run_scheduler(
@@ -586,6 +608,7 @@ async def run(
                 "request": request,
                 "token": token,
                 "mode_label": mode_cfg["label"],
+                "mode_key": mode_key,
             },
         )
 
@@ -623,11 +646,12 @@ def progress(token: str):
         return JSONResponse({"status": "error", "message": "Result expired or not found."}, status_code=404)
     now = time.time()
     start_ts = float(data.get("start_ts", now) or now)
+    mode_key = _mode_key_or_default(data.get("mode"))
     tries = int(data.get("tries", 0) or 0)
     max_tries = int(data.get("min_tries", 100) or 100)
     eta_sec = None
     elapsed = max(0.0, now - start_ts)
-    if tries > 0 and elapsed > 0.5:
+    if mode_key != "departure" and tries > 0 and elapsed > 0.5:
         rate = tries / elapsed
         if rate > 0:
             remaining = max(0, max_tries - tries)
@@ -635,10 +659,13 @@ def progress(token: str):
     return JSONResponse(
         {
             "status": data.get("status", "running"),
+            "mode": mode_key,
+            "phase": data.get("phase", ""),
             "progress": float(data.get("progress", 0.0) or 0.0),
             "tries": tries,
             "max_tries": max_tries,
             "eta_sec": eta_sec,
+            "elapsed_sec": elapsed,
             "message": data.get("message", ""),
         }
     )

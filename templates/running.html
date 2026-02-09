@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Running</title>
     <link rel="icon" href="/static/favicon.png" />
-    <link rel="stylesheet" href="/static/app.css?v=20260210q" />
+    <link rel="stylesheet" href="/static/app.css?v=20260210r" />
   </head>
   <body class="home-page app-page running-page">
     <div class="geo-bg" aria-hidden="true">
@@ -42,6 +42,28 @@
               <div id="progressBar" class="progress-bar progress-bar-live"></div>
             </div>
             <div id="progressText" class="progress-meta"></div>
+            <div id="phaseBoard" class="run-phase-board" hidden>
+              <div class="run-phase-step" data-phase="prepare">
+                <span class="run-phase-dot"></span>
+                <span class="run-phase-label">資料驗證</span>
+              </div>
+              <div class="run-phase-step" data-phase="model">
+                <span class="run-phase-dot"></span>
+                <span class="run-phase-label">建立模型</span>
+              </div>
+              <div class="run-phase-step" data-phase="solve">
+                <span class="run-phase-dot"></span>
+                <span class="run-phase-label">求解中</span>
+              </div>
+              <div class="run-phase-step" data-phase="export">
+                <span class="run-phase-dot"></span>
+                <span class="run-phase-label">輸出結果</span>
+              </div>
+              <div class="run-phase-step" data-phase="done">
+                <span class="run-phase-dot"></span>
+                <span class="run-phase-label">完成</span>
+              </div>
+            </div>
             <div id="errorText" class="error error-box"></div>
           </div>
         </section>
@@ -55,14 +77,29 @@
       }
 
       const token = '{{ token }}';
+      const modeKey = '{{ mode_key }}';
+      const isDeparture = modeKey === 'departure';
       const bar = document.getElementById('progressBar');
       const txt = document.getElementById('progressText');
+      const phaseBoard = document.getElementById('phaseBoard');
       const err = document.getElementById('errorText');
+      const phaseSteps = Array.from(document.querySelectorAll('.run-phase-step'));
+      const phaseOrder = ['prepare', 'model', 'solve', 'export', 'done'];
+      const phaseLabelMap = {
+        prepare: '資料驗證',
+        model: '建立模型',
+        solve: '求解中',
+        export: '輸出結果',
+        done: '完成',
+        error: '失敗',
+      };
 
       let backendPct = 0;
       let targetPct = 0;
       let shownPct = 0;
       let etaSec = null;
+      let elapsedSec = 0;
+      let currentPhase = 'prepare';
       let donePending = false;
       let failed = false;
       let redirecting = false;
@@ -82,15 +119,43 @@
         err.classList.remove('show');
       }
 
+      function formatElapsed(seconds) {
+        const total = Math.max(0, Math.floor(Number(seconds) || 0));
+        const hh = Math.floor(total / 3600);
+        const mm = Math.floor((total % 3600) / 60);
+        const ss = total % 60;
+        if (hh > 0) {
+          return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0') + ':' + String(ss).padStart(2, '0');
+        }
+        return String(mm).padStart(2, '0') + ':' + String(ss).padStart(2, '0');
+      }
+
+      function updatePhaseBoard() {
+        if (!isDeparture || !phaseBoard) return;
+        const activeIdx = Math.max(0, phaseOrder.indexOf(currentPhase));
+        phaseSteps.forEach((el) => {
+          el.classList.remove('is-active', 'is-complete');
+          const key = el.dataset.phase || '';
+          const idx = phaseOrder.indexOf(key);
+          if (idx >= 0 && idx < activeIdx) el.classList.add('is-complete');
+          if (idx === activeIdx) el.classList.add('is-active');
+        });
+      }
+
       function ingestProgress(data) {
         const rawPct = clamp((Number(data.progress) || 0) * 100, 0, 100);
         backendPct = Math.max(backendPct, rawPct);
+        elapsedSec = Math.max(elapsedSec, Number(data.elapsed_sec) || 0);
+        if (typeof data.phase === 'string' && data.phase.trim()) {
+          currentPhase = data.phase.trim();
+        }
 
         const nextEta = Number(data.eta_sec);
-        etaSec = Number.isFinite(nextEta) ? Math.max(0, nextEta) : null;
+        etaSec = (!isDeparture && Number.isFinite(nextEta)) ? Math.max(0, nextEta) : null;
 
         if (data.status === 'done') {
           donePending = true;
+          currentPhase = 'done';
           targetPct = 100;
           etaSec = null;
           return;
@@ -100,6 +165,13 @@
 
       function renderMeta() {
         const pct = Math.floor(shownPct);
+        if (isDeparture) {
+          const phaseLabel = phaseLabelMap[currentPhase] || '執行中';
+          const finishingText = donePending && shownPct < 99.6 ? ' | 即將完成' : '';
+          txt.textContent = '階段：' + phaseLabel + ' | 已耗時 ' + formatElapsed(elapsedSec) + finishingText;
+          updatePhaseBoard();
+          return;
+        }
         let etaText = '';
         if (etaSec !== null && !donePending) {
           const total = Math.max(0, Math.floor(etaSec));
@@ -150,6 +222,10 @@
           showError('連線不穩，正在重試...');
         }
         setTimeout(poll, 420);
+      }
+
+      if (isDeparture && phaseBoard) {
+        phaseBoard.hidden = false;
       }
 
       renderMeta();
