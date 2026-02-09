@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Running</title>
+    <link rel="icon" href="/static/favicon.png" />
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="card">
+        <h1>Running...</h1>
+        <div class="progress-wrap">
+          <div id="progressBar" class="progress-bar"></div>
+        </div>
+        <div id="progressText" style="margin-top:8px;color:#4b5563;"></div>
+        <div id="errorText" class="error"></div>
+      </div>
+    </div>
+
+    <script>
+      const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+      if (navEntry && navEntry.type === 'reload') {
+        window.location.replace('/');
+      }
+
+      const token = '{{ token }}';
+      const bar = document.getElementById('progressBar');
+      const txt = document.getElementById('progressText');
+      const err = document.getElementById('errorText');
+
+      async function poll() {
+        const resp = await fetch('/progress/' + token);
+        const data = await resp.json();
+        if (data.status === 'error') {
+          err.textContent = data.message || 'Run failed.';
+          return;
+        }
+
+        const pct = Math.floor((data.progress || 0) * 100);
+        bar.style.width = pct + '%';
+        const eta = data.eta_sec;
+        let etaText = '';
+        if (eta !== null && eta !== undefined) {
+          const total = Math.max(0, Math.floor(eta));
+          const mm = Math.floor(total / 60);
+          const ss = total % 60;
+          etaText = ' | ETA ' + mm + 'm ' + ss + 's';
+        }
+        txt.textContent = 'Progress ' + pct + '%' + etaText;
+
+        if (data.status === 'done') {
+          window.location.href = '/preview/' + token;
+          return;
+        }
+        setTimeout(poll, 500);
+      }
+
+      poll();
+    </script>
+  </body>
+</html>

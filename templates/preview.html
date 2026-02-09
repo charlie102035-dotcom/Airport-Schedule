@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>預覽結果</title>
+    <link rel="icon" href="/static/favicon.png" />
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="container" style="max-width: 1180px;">
+      <div class="card">
+        <script>
+          const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+          if (navEntry && navEntry.type === 'reload') {
+            window.location.replace('/');
+          }
+        </script>
+
+        <div class="toolbar">
+          <a class="btn btn-primary" href="/download/{{ token }}">下載 Excel</a>
+          <a class="btn" href="/report/{{ token }}">下載 PDF</a>
+          <a class="btn" href="/">回首頁</a>
+        </div>
+
+        <h2>預覽（完整班表）</h2>
+        <div class="table-wrap">
+          {{ table_html | safe }}
+        </div>
+
+        <h2>班段統計</h2>
+        {{ charts_html | safe }}
+
+        <h2>職務統計</h2>
+        {{ skill_html | safe }}
+
+        <h2>拉班次數</h2>
+        {{ pull_html | safe }}
+      </div>
+    </div>
+  </body>
+</html>

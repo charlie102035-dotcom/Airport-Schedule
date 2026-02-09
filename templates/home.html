@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TSA班表生成器</title>
+    <link rel="icon" href="/static/favicon.png" />
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="card">
+        <h1>TSA班表生成器</h1>
+        <div class="toolbar">
+          <a class="btn" href="{{ template_url }}" target="_blank" rel="noopener noreferrer">下載模板</a>
+          <a class="btn" href="{{ manual_url }}" target="_blank" rel="noopener noreferrer">使用說明書</a>
+        </div>
+
+        <form action="/run" method="post" enctype="multipart/form-data">
+          <div class="field">
+            <label for="file">Excel file (.xlsx)</label>
+            <div id="fileWrap" class="file-input-wrap">
+              <input id="file" type="file" name="file" accept=".xlsx" required />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="priorityMode">套用分隊</label>
+            <select name="priority_mode" id="priorityMode">
+              <option value="team1">一分隊</option>
+              <option value="team2">二分隊</option>
+              <option value="team3">三分隊</option>
+              <option value="custom">客製化</option>
+            </select>
+          </div>
+
+          <div id="customWrap" class="panel" style="display:none;">
+            <div style="margin-bottom: 6px; font-weight: 700;">自訂模組啟用</div>
+            <div class="flex">
+              <div>
+                <div class="muted">Activated</div>
+                <ul id="customList" class="list-clean">
+                  <li data-key="fairness" class="list-item">
+                    <input type="checkbox" class="modCheck" checked />
+                    <span>職務次數平均</span>
+                  </li>
+                  <li data-key="shift_count" class="list-item">
+                    <input type="checkbox" class="modCheck" checked />
+                    <span>班段次數平均</span>
+                  </li>
+                </ul>
+              </div>
+              <div>
+                <div class="muted">Inactivated</div>
+                <ul id="inactiveList" class="list-clean" style="min-height:24px;border:1px dashed #d0d9e6;padding:6px;border-radius:8px;"></ul>
+              </div>
+            </div>
+          </div>
+
+          <input type="hidden" name="custom_order" id="customOrder" value="fairness,shift_count" />
+
+          <div id="scoreWrap" class="panel" style="display:none;">
+            <div style="margin-bottom: 6px; font-weight: 700;">我們最注重......（由上到下，倍率 3/2/1）</div>
+            <ul id="scoreOrderList" class="list-clean">
+              <li data-key="fairness" class="list-item">
+                <span style="width: 150px;">職務次數平均</span>
+                <button type="button" class="btn upBtn">↑</button>
+                <button type="button" class="btn downBtn">↓</button>
+              </li>
+              <li data-key="shift" class="list-item">
+                <span style="width: 150px;">班段次數平均</span>
+                <button type="button" class="btn upBtn">↑</button>
+                <button type="button" class="btn downBtn">↓</button>
+              </li>
+              <li data-key="pull" class="list-item">
+                <span style="width: 150px;">拉班次數平均</span>
+                <button type="button" class="btn upBtn">↑</button>
+                <button type="button" class="btn downBtn">↓</button>
+              </li>
+            </ul>
+            <input type="hidden" name="score_order" id="scoreOrder" value="fairness,shift,pull" />
+          </div>
+
+          <button class="btn btn-primary" type="submit">Run</button>
+        </form>
+
+        <div class="manual-preview">
+          <h2>說明書預覽</h2>
+          {% if manual_preview_url %}
+          <div
+            id="manualPages"
+            class="manual-pages"
+            data-pdf-url="{{ manual_preview_url }}"
+          ></div>
+          {% else %}
+          <div class="manual-placeholder">
+            尚未找到可預覽的 PDF。請將說明書檔案放到 <code>static/manual.pdf</code>。
+          </div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const modeSel = document.getElementById('priorityMode');
+      const customWrap = document.getElementById('customWrap');
+      const scoreWrap = document.getElementById('scoreWrap');
+      const customList = document.getElementById('customList');
+      const inactiveList = document.getElementById('inactiveList');
+      const customOrder = document.getElementById('customOrder');
+      const scoreList = document.getElementById('scoreOrderList');
+      const scoreOrder = document.getElementById('scoreOrder');
+      const fileInput = document.getElementById('file');
+      const fileWrap = document.getElementById('fileWrap');
+
+      function animateListFlip(listEl, moveAction) {
+        const items = Array.from(listEl.querySelectorAll('li'));
+        const first = new Map(items.map((el) => [el, el.getBoundingClientRect()]));
+        moveAction();
+        const movedItems = Array.from(listEl.querySelectorAll('li'));
+        movedItems.forEach((el) => {
+          const from = first.get(el);
+          if (!from) return;
+          const to = el.getBoundingClientRect();
+          const dx = from.left - to.left;
+          const dy = from.top - to.top;
+          if (dx === 0 && dy === 0) return;
+          el.animate(
+            [
+              { transform: `translate(${dx}px, ${dy}px)` },
+              { transform: 'translate(0, 0)' },
+            ],
+            {
+              duration: 220,
+              easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+            }
+          );
+        });
+      }
+
+      function syncOrder() {
+        const keys = Array.from(customList.querySelectorAll('li')).map(li => li.dataset.key);
+        customOrder.value = keys.join(',');
+      }
+
+      function syncScoreOrder() {
+        const keys = Array.from(scoreList.querySelectorAll('li')).map(li => li.dataset.key);
+        scoreOrder.value = keys.join(',');
+      }
+
+      function syncModeVisibility() {
+        const isCustom = modeSel.value === 'custom';
+        customWrap.style.display = isCustom ? 'block' : 'none';
+        scoreWrap.style.display = isCustom ? 'block' : 'none';
+      }
+
+      modeSel.addEventListener('change', syncModeVisibility);
+      syncModeVisibility();
+
+      customWrap.addEventListener('change', (e) => {
+        const target = e.target;
+        if (!(target instanceof HTMLInputElement) || !target.classList.contains('modCheck')) return;
+        const li = target.closest('li');
+        if (!li) return;
+        const source = li.parentElement;
+        const dest = target.checked ? customList : inactiveList;
+        animateListFlip(source, () => {
+          dest.appendChild(li);
+        });
+        if (source !== dest) {
+          animateListFlip(dest, () => {});
+        }
+        syncOrder();
+      });
+
+      scoreList.addEventListener('click', (e) => {
+        if (!(e.target instanceof HTMLButtonElement)) return;
+        const li = e.target.closest('li');
+        if (!li) return;
+        if (e.target.classList.contains('upBtn')) {
+          const prev = li.previousElementSibling;
+          if (prev) {
+            animateListFlip(scoreList, () => {
+              scoreList.insertBefore(li, prev);
+            });
+          }
+        } else if (e.target.classList.contains('downBtn')) {
+          const next = li.nextElementSibling;
+          if (next) {
+            animateListFlip(scoreList, () => {
+              scoreList.insertBefore(next, li);
+            });
+          }
+        }
+        syncScoreOrder();
+      });
+
+      syncOrder();
+      syncScoreOrder();
+
+      fileInput.addEventListener('change', () => {
+        const f = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+        if (!f) {
+          fileWrap.classList.remove('success');
+          return;
+        }
+
+        fileWrap.classList.add('success');
+
+        fileWrap.classList.remove('pulse-once');
+        void fileWrap.offsetWidth;
+        fileWrap.classList.add('pulse-once');
+      });
+    </script>
+    {% if manual_preview_url %}
+    <script type="module">
+      import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs';
+      const wrap = document.getElementById('manualPages');
+      if (wrap) {
+        const pdfUrl = wrap.dataset.pdfUrl;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
+        const loadingTask = pdfjsLib.getDocument(pdfUrl);
+        loadingTask.promise.then(async (pdf) => {
+          for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: 1 });
+            const containerWidth = Math.max(320, wrap.clientWidth - 24);
+            const scale = containerWidth / viewport.width;
+            const scaledViewport = page.getViewport({ scale });
+
+            const pageCard = document.createElement('div');
+            pageCard.className = 'manual-page-card';
+
+            const canvas = document.createElement('canvas');
+            canvas.className = 'manual-canvas';
+            const context = canvas.getContext('2d');
+            canvas.width = Math.floor(scaledViewport.width);
+            canvas.height = Math.floor(scaledViewport.height);
+            pageCard.appendChild(canvas);
+            wrap.appendChild(pageCard);
+
+            await page.render({ canvasContext: context, viewport: scaledViewport }).promise;
+          }
+        }).catch((err) => {
+          wrap.innerHTML = '<div class="manual-placeholder">PDF 載入失敗，請改用上方「使用說明書」按鈕開啟。</div>';
+          console.error(err);
+        });
+      }
+    </script>
+    {% endif %}
+  </body>
+</html>

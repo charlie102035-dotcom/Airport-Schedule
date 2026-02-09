@@ -19,11 +19,65 @@ SMART_TEAM_PICK = False  # fixed A/B by early/late rules; no dynamic switching
 
 SHIFT_ORDER = ["出境5", "出境6", "入境10", "入境11", "出境7", "出境8"]
 RESCUE_FILL_ALL = True  # if still short after round2, keep pulling until cand exhausted
+SHIFT_NUM_TO_NAME = {
+    5: "出境5",
+    6: "出境6",
+    7: "出境7",
+    8: "出境8",
+    10: "入境10",
+    11: "入境11",
+}
 
 
 def _debug(msg: str) -> None:
     if DEBUG_SCHED:
         print(msg)
+
+
+def _shift_from_num_token(token: str | None) -> str | None:
+    if token is None:
+        return None
+    try:
+        n = int(str(token).strip())
+    except Exception:
+        return None
+    return SHIFT_NUM_TO_NAME.get(n)
+
+
+def _parse_substitute_cell(raw_value: str) -> tuple[str, str | None, str | None]:
+    """Parse substitution text like 代昱安10 -> (昱安, 入境10, 10)."""
+    s = str(raw_value or "").strip()
+    if s == "":
+        return ("", None, None)
+
+    body = s
+    if body.startswith("代班"):
+        body = body[2:]
+    elif body.startswith("代"):
+        body = body[1:]
+    body = body.strip()
+
+    nums = re.findall(r"(\d+)", body)
+    num_token = nums[-1] if nums else None
+    forced_shift = _shift_from_num_token(num_token)
+    helper = re.sub(r"\d+", "", body).strip().strip("()（） ")
+    return (helper, forced_shift, num_token)
+
+
+def _infer_day_shift_set(work_text: str) -> set[str]:
+    w = str(work_text or "").strip()
+    has_in = ("入境" in w) or w.startswith("入")
+    has_out = ("出境" in w) or w.startswith("出")
+    has_rest = ("輪休" in w)
+    if has_rest:
+        return set()
+    if has_in and has_out:
+        return set(SHIFT_ORDER)
+    if has_in:
+        return {"入境10", "入境11"}
+    if has_out:
+        return {"出境5", "出境6", "出境7", "出境8"}
+    return set()
 
 def validate_input_excel(input_excel_path: str) -> list[dict]:
     """Validate input Excel before scheduling.
@@ -213,6 +267,71 @@ def validate_input_excel(input_excel_path: str) -> list[dict]:
                         "columns": sorted(typo_cols),
                         "reason": "含不合規字元(僅允許空白/休/請假/優/代開頭)",
                         "cells": typo_cells,
+                    }
+                )
+
+            # Validate forced shift marker in substitution cell, e.g. 代昱安10
+            forced_bad_cols: set[str] = set()
+            forced_bad_cells: list[dict] = []
+            if len(cols) > 2:
+                employee_col_info = [(i, cols[i]) for i in range(2, len(cols))]
+                data_start_idx = _detect_data_start_idx(dayoff_raw, cols[2:])
+                data_block = dayoff_raw.iloc[data_start_idx:].copy() if len(dayoff_raw) > data_start_idx else dayoff_raw.copy()
+                dates = _date_series(data_block)
+                work_series = data_block["工作"].fillna("").astype(str).str.strip() if "工作" in data_block.columns else pd.Series([""] * len(data_block), index=data_block.index)
+
+                for col_idx, col_name in employee_col_info:
+                    try:
+                        s = data_block.iloc[:, col_idx].fillna("").astype(str).str.strip()
+                    except Exception:
+                        continue
+                    if s.eq("").all():
+                        continue
+
+                    for row_i, raw_val in s.items():
+                        v = str(raw_val or "").strip()
+                        if v == "" or not v.startswith("代"):
+                            continue
+                        _, forced_shift, num_token = _parse_substitute_cell(v)
+                        if num_token is None:
+                            continue
+
+                        bad = False
+                        if forced_shift is None:
+                            bad = True
+                        else:
+                            work_text = str(work_series.get(row_i, "") or "").strip()
+                            allowed = _infer_day_shift_set(work_text)
+                            if forced_shift not in allowed:
+                                bad = True
+
+                        if not bad:
+                            continue
+
+                        forced_bad_cols.add(col_name)
+                        day_num = None
+                        if dates is not None:
+                            try:
+                                d = dates.loc[row_i]
+                                if not pd.isna(d):
+                                    day_num = int(d)
+                            except Exception:
+                                pass
+                        forced_bad_cells.append(
+                            {
+                                "day": day_num,
+                                "person": str(col_name),
+                                "value": v,
+                            }
+                        )
+
+            if forced_bad_cols:
+                issues.append(
+                    {
+                        "sheet": "排休",
+                        "columns": sorted(forced_bad_cols),
+                        "reason": "指定班段與當天班別不符或班段代碼無效",
+                        "cells": forced_bad_cells,
                     }
                 )
 
@@ -709,10 +828,12 @@ def run_scheduler(
 
         off_days: list[int] = []
         sub_pairs: list[tuple[int, str]] = []
+        forced_pairs: list[tuple[int, str]] = []
 
         for _, r in tmp.iterrows():
             day_i = int(r["日期"])
             val = r[emp]
+            work_text = str(r.get("工作", "") or "").strip()
 
             if val == "":
                 continue
@@ -722,11 +843,15 @@ def run_scheduler(
                 continue
 
             if (val in SUB_MARKERS) or val.startswith("代"):
-                helper = str(val)
-                if helper.startswith("代"):
-                    helper = helper[1:]
-                helper = helper.strip().strip("()（） ")
+                helper, forced_shift, num_token = _parse_substitute_cell(val)
                 sub_pairs.append((day_i, helper))
+                if num_token is not None and forced_shift is None:
+                    raise ValueError(f"[ERROR] 排休指定班段無效: {emp} {day_i}號 ({val})")
+                if forced_shift is not None:
+                    allowed = _infer_day_shift_set(work_text)
+                    if forced_shift not in allowed:
+                        raise ValueError(f"[ERROR] 排休指定班段與當天班別不符: {emp} {day_i}號 ({val})")
+                    forced_pairs.append((day_i, forced_shift))
                 continue
 
         def _dedupe_keep_order(nums: list[int]) -> list[int]:
@@ -745,6 +870,9 @@ def run_scheduler(
             "代班": {},
             "代班日期": [],
             "代班人員": [],
+            "指定班段": {},
+            "指定班段日期": [],
+            "班段鎖定": {},
             "職能": {},
             "公平性分數": {},
             "拉班次數": 0,
@@ -762,6 +890,14 @@ def run_scheduler(
         people_dict[emp]["代班"] = sub_map
         people_dict[emp]["代班日期"] = list(sub_map.keys())
         people_dict[emp]["代班人員"] = [sub_map[k] for k in sub_map.keys()]
+
+        forced_map: dict[int, str] = {}
+        for day_i, shift_i in forced_pairs:
+            if day_i not in forced_map:
+                forced_map[day_i] = shift_i
+        people_dict[emp]["指定班段"] = forced_map
+        people_dict[emp]["指定班段日期"] = list(forced_map.keys())
+        people_dict[emp]["班段鎖定"] = {k: True for k in forced_map.keys()}
 
     # -------------------------
     # Skill matrix mapping (same behavior, but raise instead of print)
@@ -982,6 +1118,8 @@ def run_scheduler(
     if days_limit is None:
         DAYS_LIMIT = len(daily_list)
 
+    _validate_forced_shift_matches_day(daily_list, employee_cols, people_dict)
+
     # -------------------------
     # Run scheduling (search-best or single)
     # -------------------------
@@ -1159,6 +1297,7 @@ def run_scheduler(
 
     # Precompute pulled cells for coloring (use 原員工)
     pulled_cells: set[tuple[int, str]] = set()
+    strong_pulled_cells: set[tuple[int, str]] = set()
     for dd in daily_list[:DAYS_LIMIT]:
         if not isinstance(dd, dict):
             continue
@@ -1174,6 +1313,8 @@ def run_scheduler(
                 name = str(rec.get("原員工", rec.get("人員", "")) or "").strip()
                 if name:
                     pulled_cells.add((d, name))
+                    if bool(rec.get("強拉", False)):
+                        strong_pulled_cells.add((d, name))
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         roster_df.to_excel(writer, sheet_name="Roster")
@@ -1184,6 +1325,7 @@ def run_scheduler(
         fill_green = PatternFill("solid", fgColor="C6E0B4")
         fill_gray = PatternFill("solid", fgColor="E7E6E6")
         fill_pink = PatternFill("solid", fgColor="F8CBAD")
+        fill_purple = PatternFill("solid", fgColor="D9B8FF")
         fill_red_empty = PatternFill("solid", fgColor="F4CCCC")
 
         header_font = Font(bold=True)
@@ -1224,7 +1366,9 @@ def run_scheduler(
                 c = ws.cell(row=i, column=j)
                 name = str(roster_df.columns[j - 2])
                 val = str(c.value or "")
-                if (int(day), name) in pulled_cells:
+                if (int(day), name) in strong_pulled_cells:
+                    c.fill = fill_purple
+                elif (int(day), name) in pulled_cells:
                     c.fill = fill_pink
                 if best_is_bad and val == "":
                     c.fill = fill_red_empty
@@ -1379,6 +1523,51 @@ def _is_sub_day(emp: str, d: int, people_dict: dict) -> bool:
             continue
 
     return False
+
+
+def _forced_shift_on_day(emp: str, d: int, people_dict: dict) -> str:
+    info = people_dict.get(emp, {}) if isinstance(people_dict, dict) else {}
+    forced = info.get("指定班段", {})
+    if isinstance(forced, dict):
+        try:
+            v = forced.get(int(d), "")
+            return str(v or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def _is_locked_on_day(emp: str, d: int, people_dict: dict) -> bool:
+    return _forced_shift_on_day(emp, d, people_dict) != ""
+
+
+def _validate_forced_shift_matches_day(daily_list: list[dict], employee_cols, people_dict: dict) -> None:
+    day_shift_keys: dict[int, set[str]] = {}
+    for dd in (daily_list[:DAYS_LIMIT] or []):
+        if not isinstance(dd, dict):
+            continue
+        d = int(dd.get("日期", 0) or 0)
+        keys = set((dd.get("班段", {}) or {}).keys())
+        day_shift_keys[d] = keys
+
+    for emp in employee_cols:
+        if emp not in people_dict:
+            continue
+        info = people_dict.get(emp, {}) if isinstance(people_dict, dict) else {}
+        forced = info.get("指定班段", {})
+        if not isinstance(forced, dict):
+            continue
+        for d, sh in forced.items():
+            try:
+                di = int(d)
+            except Exception:
+                continue
+            shift_name = str(sh or "").strip()
+            if shift_name == "":
+                continue
+            valid_set = day_shift_keys.get(di, set())
+            if shift_name not in valid_set:
+                raise ValueError(f"[ERROR] 指定班段與當天班別不符: {emp} {di}號 -> {shift_name}")
 
 def _next_day_dict(d: int) -> dict | None:
     """Get next calendar day's dict from global daily_list (may be None)."""
@@ -1610,6 +1799,7 @@ def _repair_in11_shortage(daily_list: list[dict], people_dict: dict, employee_co
                 "代班人": "",
                 "cover": "填補",
                 "拉班": A_pull,
+                "強拉": bool(A_pull and _is_locked_on_day(A_chosen, d, people_dict)),
             })
             try:
                 counts = people_dict[A_chosen].get("班段次數", {})
@@ -1633,6 +1823,7 @@ def _repair_in11_shortage(daily_list: list[dict], people_dict: dict, employee_co
                 "代班人": "",
                 "cover": "填補",
                 "拉班": B_pull,
+                "強拉": bool(B_pull and _is_locked_on_day(B_chosen, d, people_dict)),
             })
             try:
                 counts = people_dict[B_chosen].get("班段次數", {})
@@ -1853,6 +2044,12 @@ def assign_employees_to_shift(
             return {}
         return people_dict.get(emp, {}).get("職能", {}) or {}
 
+    def _forced_shift_today(emp: str) -> str:
+        return _forced_shift_on_day(emp, d, people_dict)
+
+    def _is_forced_for_this_shift(emp: str) -> bool:
+        return _forced_shift_today(emp) == shift_name
+
     def _other_team(team: str) -> str:
         if team == "A":
             return "B"
@@ -1928,6 +2125,9 @@ def assign_employees_to_shift(
             return 0
         return 1 if _pull_count(emp) > cap else 0
 
+    def _sc_pull_locked(emp: str, ctx: dict) -> int:
+        return 1 if _is_locked_on_day(emp, d, people_dict) else 0
+
     def _sc_pull_count(emp: str, ctx: dict) -> int:
         return _pull_count(emp)
 
@@ -1962,9 +2162,9 @@ def assign_employees_to_shift(
     }
     # Team-specific scorer priority (order = priority)
     TEAM_SCORERS_PULL = {
-        "A": [_sc_pull_over_cap, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
-        "B": [_sc_pull_over_cap, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
-        "C": [_sc_pull_over_cap, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
+        "A": [_sc_pull_over_cap, _sc_pull_locked, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
+        "B": [_sc_pull_over_cap, _sc_pull_locked, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
+        "C": [_sc_pull_over_cap, _sc_pull_locked, _sc_pull_count, _sc_shift_count, _sc_inbound_prev_day_pref],
     }
     TEAM_SCORERS_NONPULL = {
         # A/B: fairness before shift count
@@ -2180,6 +2380,7 @@ def assign_employees_to_shift(
             "代班人": sub_name,
             "cover": missing_sk,
             "拉班": is_pull,
+            "強拉": bool(is_pull and _is_locked_on_day(chosen_emp, d, people_dict)),
         })
 
         # 班段次數更新
@@ -2242,11 +2443,26 @@ def assign_employees_to_shift(
         team_ok = ctx.get("team_ok", []) or []
         target_skill = ctx.get("target_skill", "")
         is_pull_round = bool(ctx.get("is_pull_round", False))
+        forced_applied = False
+        pool = team_ok[:]
+
+        # Non-pull round: prioritize employees locked to this day's shift.
+        if not is_pull_round:
+            forced_pool = [emp for emp in pool if _is_forced_for_this_shift(emp)]
+            if forced_pool:
+                pool = forced_pool
+                forced_applied = True
+
         if target_skill:
             if is_pull_round:
-                return team_ok[:]
-            return [emp for emp in team_ok if _has_skill(emp, target_skill)]
-        return team_ok[:]
+                return pool
+            skilled = [emp for emp in pool if _has_skill(emp, target_skill)]
+            if skilled:
+                return skilled
+            if forced_applied:
+                return pool
+            return []
+        return pool
 
     def _mod_rules(ctx: dict, eligible: list[str]) -> list[str]:
         rules = RULES_BY_TEAM.get(ctx.get("team_to_use", ""), RULES_BASE)
@@ -2331,6 +2547,7 @@ def assign_employees_to_shift(
                 "代班人": sub_name,
                 "cover": cover_role,
                 "拉班": is_pull_round,
+                "強拉": bool(is_pull_round and _is_locked_on_day(chosen, d, people_dict)),
             })
 
             # 班段次數更新
@@ -2395,6 +2612,7 @@ def assign_employees_to_shift(
                 "代班人": sub_name,
                 "cover": "填補",
                 "拉班": True,
+                "強拉": bool(_is_locked_on_day(chosen, d, people_dict)),
             })
 
             # 班段次數更新

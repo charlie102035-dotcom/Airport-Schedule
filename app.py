@@ -3,14 +3,16 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
+from functools import lru_cache
 import time
 import uuid
-import pandas as pd
+import html
 from openpyxl import load_workbook
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -19,17 +21,23 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# 讓 Python 找得到上層的「機場排班程式.py」
+# 讓 Python 找得到同層/上層的「機場排班程式.py」
 import sys
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
+sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(PROJECT_DIR))
 
-from 機場排班程式 import run_scheduler, validate_input_excel  # noqa: E402
+@lru_cache(maxsize=1)
+def _get_scheduler_funcs():
+    from 機場排班程式 import run_scheduler, validate_input_excel  # noqa: E402
+
+    return run_scheduler, validate_input_excel
 
 
 app = FastAPI(title="Airport Scheduler MVP")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # Simple in-memory store for recent results (token -> metadata)
 _RESULTS: dict[str, dict] = {}
@@ -62,10 +70,15 @@ def _pop_result(token: str) -> dict | None:
 
 
 def _get_result(token: str) -> dict | None:
+    _cleanup_expired_results()
     data = _RESULTS.get(token)
     if data:
         data["ts"] = time.time()
     return data
+
+
+def _esc(v) -> str:
+    return html.escape(str(v if v is not None else ""), quote=True)
 
 
 def _init_progress(token: str, tmpdir: Path, min_tries: int) -> None:
@@ -152,163 +165,48 @@ def _cleanup_expired_results() -> None:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _find_manual_preview_url() -> str | None:
+    static_dir = BASE_DIR / "static"
+    preferred = [
+        static_dir / "manual.pdf",
+        static_dir / "使用說明書.pdf",
+    ]
+    candidates: list[Path] = []
+    for p in preferred:
+        if p.exists() and p.is_file():
+            candidates.append(p)
+
+    if not candidates:
+        candidates = [p for p in static_dir.glob("*.pdf") if p.is_file()]
+    if not candidates:
+        return None
+
+    # Always use the newest file and append mtime to bypass browser cache.
+    chosen = max(candidates, key=lambda p: p.stat().st_mtime)
+    ver = int(chosen.stat().st_mtime)
+    return f"/static/{chosen.name}?v={ver}"
+
+    
+
+
 @app.get("/", response_class=HTMLResponse)
-def home():
-    # 一個最簡單的上傳頁，不用任何前端框架
-    return """
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Airport Scheduler</title>
-        <link rel="icon" href="/static/favicon.png" />
-      </head>
-      <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-        <h2>TSA班表生成器</h2>
-        <p>
-          <a href="https://drive.google.com/drive/folders/1mNXtRv5olbJQAGhnVy30mBoa8m4nTAJT?usp=sharing" target="_blank" rel="noopener noreferrer">
-            下載模板
-          </a>
-        </p>
-        <p>
-          <a href="https://drive.google.com/file/d/1ypcRSL7oebprND6yXXhVLAe_QJ2uxFD1/view?usp=share_link" target="_blank" rel="noopener noreferrer" style="display: inline-block; padding: 6px 12px; border: 1px solid #999; border-radius: 4px; text-decoration: none; color: #111;">
-            使用說明書
-          </a>
-        </p>
-
-        <form action="/run" method="post" enctype="multipart/form-data">
-          <p>
-            Excel file (.xlsx):
-            <input type="file" name="file" accept=".xlsx" required />
-          </p>
-
-          <p>
-            套用分隊:
-            <select name="priority_mode" id="priorityMode">
-              <option value="team1">一分隊</option>
-              <option value="team2">二分隊</option>
-              <option value="team3">三分隊</option>
-              <option value="custom">客製化</option>
-            </select>
-          </p>
-
-          <div id="customWrap" style="display: none; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
-            <div style="margin-bottom: 6px;">自訂模組啟用</div>
-            <div style="display: flex; gap: 16px;">
-              <div style="flex: 1;">
-                <div style="font-size: 12px; color: #666; margin-bottom: 6px;">Activated</div>
-                <ul id="customList" style="list-style: none; padding: 0; margin: 0;">
-                  <li data-key="fairness" style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
-                    <input type="checkbox" class="modCheck" checked />
-                    <span style="width: 120px;">職務次數平均</span>
-                  </li>
-                  <li data-key="shift_count" style="display: flex; align-items: center; gap: 8px;">
-                    <input type="checkbox" class="modCheck" checked />
-                    <span style="width: 120px;">班段次數平均</span>
-                  </li>
-                </ul>
-              </div>
-              <div style="flex: 1;">
-                <div style="font-size: 12px; color: #666; margin-bottom: 6px;">Inactivated</div>
-                <ul id="inactiveList" style="list-style: none; padding: 0; margin: 0; min-height: 24px; border: 1px dashed #ddd; padding: 6px;">
-                </ul>
-              </div>
-            </div>
-          </div>
-
-          <input type="hidden" name="custom_order" id="customOrder" value="fairness,shift_count" />
-
-          <div id="scoreWrap" style="display: none; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px;">
-            <div style="margin-bottom: 6px;">我們最注重......（由上到下，倍率 3/2/1）</div>
-            <ul id="scoreOrderList" style="list-style: none; padding: 0; margin: 0;">
-              <li data-key="fairness" style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
-                <span style="width: 140px;">職務次數平均</span>
-                <button type="button" class="upBtn">↑</button>
-                <button type="button" class="downBtn">↓</button>
-              </li>
-              <li data-key="shift" style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
-                <span style="width: 140px;">班段次數平均</span>
-                <button type="button" class="upBtn">↑</button>
-                <button type="button" class="downBtn">↓</button>
-              </li>
-              <li data-key="pull" style="display: flex; align-items: center; gap: 8px;">
-                <span style="width: 140px;">拉班次數平均</span>
-                <button type="button" class="upBtn">↑</button>
-                <button type="button" class="downBtn">↓</button>
-              </li>
-            </ul>
-            <input type="hidden" name="score_order" id="scoreOrder" value="fairness,shift,pull" />
-          </div>
-
-          <button type="submit">Run</button>
-        </form>
-        <script>
-          const modeSel = document.getElementById('priorityMode');
-          const customWrap = document.getElementById('customWrap');
-          const scoreWrap = document.getElementById('scoreWrap');
-          const customList = document.getElementById('customList');
-          const inactiveList = document.getElementById('inactiveList');
-          const customOrder = document.getElementById('customOrder');
-          const scoreList = document.getElementById('scoreOrderList');
-          const scoreOrder = document.getElementById('scoreOrder');
-
-          function syncOrder() {
-            const keys = Array.from(customList.querySelectorAll('li')).map(li => li.dataset.key);
-            customOrder.value = keys.join(',');
-          }
-          function syncScoreOrder() {
-            const keys = Array.from(scoreList.querySelectorAll('li')).map(li => li.dataset.key);
-            scoreOrder.value = keys.join(',');
-          }
-
-          modeSel.addEventListener('change', () => {
-            const isCustom = modeSel.value === 'custom';
-            customWrap.style.display = isCustom ? 'block' : 'none';
-            scoreWrap.style.display = isCustom ? 'block' : 'none';
-          });
-          {
-            const isCustomInit = modeSel.value === 'custom';
-            customWrap.style.display = isCustomInit ? 'block' : 'none';
-            scoreWrap.style.display = isCustomInit ? 'block' : 'none';
-          }
-
-          customWrap.addEventListener('change', (e) => {
-            const target = e.target;
-            if (!(target instanceof HTMLInputElement)) return;
-            if (!target.classList.contains('modCheck')) return;
-            const li = target.closest('li');
-            if (!li) return;
-            if (target.checked) {
-              customList.appendChild(li);
-            } else {
-              inactiveList.appendChild(li);
-            }
-            syncOrder();
-          });
-
-          scoreList.addEventListener('click', (e) => {
-            if (!(e.target instanceof HTMLButtonElement)) return;
-            const li = e.target.closest('li');
-            if (!li) return;
-            if (e.target.classList.contains('upBtn')) {
-              const prev = li.previousElementSibling;
-              if (prev) scoreList.insertBefore(li, prev);
-            } else if (e.target.classList.contains('downBtn')) {
-              const next = li.nextElementSibling;
-              if (next) scoreList.insertBefore(next, li);
-            }
-            syncScoreOrder();
-          });
-          syncOrder();
-          syncScoreOrder();
-        </script>
-      </body>
-    </html>
-    """
+def home(request: Request):
+    manual_preview_url = _find_manual_preview_url()
+    return templates.TemplateResponse(
+        "home.html",
+        {
+            "request": request,
+            "template_url": "https://drive.google.com/drive/folders/1mNXtRv5olbJQAGhnVy30mBoa8m4nTAJT?usp=sharing",
+            "manual_url": "https://drive.google.com/file/d/1ypcRSL7oebprND6yXXhVLAe_QJ2uxFD1/view?usp=share_link",
+            "manual_preview_url": manual_preview_url,
+        },
+    )
 
 
 @app.post("/run")
 async def run(
     background_tasks: BackgroundTasks,
+    request: Request,
     file: UploadFile = File(...),
     priority_mode: str = Form("team1"),
     custom_order: str = Form("fairness,shift_count"),
@@ -337,32 +235,17 @@ async def run(
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
         # 4.1) 輸入資料檢查：立即回報錯誤欄位並返回首頁
+        run_scheduler, validate_input_excel = _get_scheduler_funcs()
         validation_errors = validate_input_excel(str(in_path))
         if validation_errors:
             msg = _format_validation_errors(validation_errors)
-            safe_msg = (
-                msg.replace("\\", "\\\\").replace("\n", "\\n").replace("'", "\\'")
-            )
             shutil.rmtree(tmpdir, ignore_errors=True)
-            return HTMLResponse(
-                f"""
-                <html>
-                  <head>
-                    <meta charset="utf-8" />
-                    <title>輸入資料錯誤</title>
-                    <link rel="icon" href="/static/favicon.png" />
-                  </head>
-                  <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-                    <script>
-                      alert('{safe_msg}');
-                      window.location.href = '/';
-                    </script>
-                    <p>輸入資料有誤，請依照提示修正後重試。</p>
-                    <pre style="white-space: pre-wrap; border: 1px solid #ddd; padding: 10px;">{msg}</pre>
-                    <p><a href="/">回首頁</a></p>
-                  </body>
-                </html>
-                """,
+            return templates.TemplateResponse(
+                "validation_error.html",
+                {
+                    "request": request,
+                    "message": msg,
+                },
                 status_code=400,
             )
 
@@ -397,58 +280,12 @@ async def run(
 
         background_tasks.add_task(_run_job)
 
-        return HTMLResponse(
-            f"""
-            <html>
-              <head>
-                <meta charset="utf-8" />
-                <title>Airport Scheduler</title>
-                <link rel="icon" href="/static/favicon.png" />
-              </head>
-              <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto;">
-                <h2>Running...</h2>
-                <div style="width: 100%; height: 12px; border: 1px solid #999; background: #f2f2f2;">
-                  <div id="progressBar" style="height: 100%; width: 0%; background: #4a90e2;"></div>
-                </div>
-                <div id="progressText" style="margin-top: 6px; font-size: 12px; color: #555;"></div>
-                <div id="errorText" style="margin-top: 12px; color: #b00020;"></div>
-                <script>
-                  const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
-                  if (navEntry && navEntry.type === 'reload') {{
-                    window.location.replace('/');
-                  }}
-                  const bar = document.getElementById('progressBar');
-                  const txt = document.getElementById('progressText');
-                  const err = document.getElementById('errorText');
-                  async function poll() {{
-                    const resp = await fetch('/progress/{token}');
-                    const data = await resp.json();
-                    if (data.status === 'error') {{
-                      err.textContent = data.message || 'Run failed.';
-                      return;
-                    }}
-                    const pct = Math.floor((data.progress || 0) * 100);
-                    bar.style.width = pct + '%';
-                    const eta = data.eta_sec;
-                    let etaText = '';
-                    if (eta !== null && eta !== undefined) {{
-                      const total = Math.max(0, Math.floor(eta));
-                      const mm = Math.floor(total / 60);
-                      const ss = total % 60;
-                      etaText = ' | ETA ' + mm + 'm ' + ss + 's';
-                    }}
-                    txt.textContent = 'Progress ' + pct + '%'+ etaText;
-                    if (data.status === 'done') {{
-                      window.location.href = '/preview/{token}';
-                      return;
-                    }}
-                    setTimeout(poll, 500);
-                  }}
-                  poll();
-                </script>
-              </body>
-            </html>
-            """
+        return templates.TemplateResponse(
+            "running.html",
+            {
+                "request": request,
+                "token": token,
+            },
         )
 
     except Exception:
@@ -505,7 +342,7 @@ def progress(token: str):
 
 
 @app.get("/preview/{token}", response_class=HTMLResponse)
-def preview(token: str):
+def preview(token: str, request: Request):
     data = _get_result(token)
     if not data:
         raise HTTPException(status_code=404, detail="Result expired or not found.")
@@ -535,7 +372,7 @@ def preview(token: str):
         cells = []
         for c in range(1, max_cols + 1):
             cell = ws.cell(row=r, column=c)
-            val = "" if cell.value is None else str(cell.value)
+            val = _esc("" if cell.value is None else str(cell.value))
             styles = []
             fill = cell.fill
             if fill and getattr(fill, "fill_type", None) not in (None, "none"):
@@ -580,9 +417,10 @@ def preview(token: str):
                 except Exception:
                     val = 0
                 width = int((val / max_val) * 200)
+                safe_name = _esc(name)
                 rows.append(
                     f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
-                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{name}</div>"
+                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{safe_name}</div>"
                     f"<div style='height:12px;width:{width}px;background:{color};'></div>"
                     f"<div style='width:24px;text-align:right;'>{val}</div>"
                     f"</div>"
@@ -591,7 +429,7 @@ def preview(token: str):
 
         charts_html += (
             f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;'>"
-            f"<div style='font-weight:600;margin-bottom:8px;'>{sh}</div>"
+            f"<div style='font-weight:600;margin-bottom:8px;'>{_esc(sh)}</div>"
             f"<div style='display:flex;gap:16px;'>"
             f"<div style='flex:1;border-right:1px solid #eee;padding-right:8px;'>"
             f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>A組</div>"
@@ -625,9 +463,10 @@ def preview(token: str):
                 except Exception:
                     val = 0
                 width = int((val / max_val) * 200)
+                safe_name = _esc(name)
                 rows.append(
                     f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
-                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{name}</div>"
+                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{safe_name}</div>"
                     f"<div style='height:12px;width:{width}px;background:{color};'></div>"
                     f"<div style='width:24px;text-align:right;'>{val}</div>"
                     f"</div>"
@@ -636,7 +475,7 @@ def preview(token: str):
 
         skill_html += (
             f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;'>"
-            f"<div style='font-weight:600;margin-bottom:8px;'>{sk}</div>"
+            f"<div style='font-weight:600;margin-bottom:8px;'>{_esc(sk)}</div>"
             f"<div style='display:flex;gap:16px;'>"
             f"<div style='flex:1;border-right:1px solid #eee;padding-right:8px;'>"
             f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>A組</div>"
@@ -670,9 +509,10 @@ def preview(token: str):
                 except Exception:
                     val = 0
                 width = int((val / max_val) * 200)
+                safe_name = _esc(name)
                 rows.append(
                     f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
-                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{name}</div>"
+                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{safe_name}</div>"
                     f"<div style='height:12px;width:{width}px;background:{color};'></div>"
                     f"<div style='width:24px;text-align:right;'>{val}</div>"
                     f"</div>"
@@ -681,7 +521,7 @@ def preview(token: str):
 
         pull_html += (
             f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;'>"
-            f"<div style='font-weight:600;margin-bottom:8px;'>{title}</div>"
+            f"<div style='font-weight:600;margin-bottom:8px;'>{_esc(title)}</div>"
             f"<div style='display:flex;gap:16px;'>"
             f"<div style='flex:1;border-right:1px solid #eee;padding-right:8px;'>"
             f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>A組</div>"
@@ -695,37 +535,16 @@ def preview(token: str):
             f"</div>"
         )
 
-    return HTMLResponse(
-        f"""
-        <html>
-          <head>
-            <meta charset="utf-8" />
-            <title>Preview</title>
-            <link rel="icon" href="/static/favicon.png" />
-          </head>
-            <body style="font-family: sans-serif; max-width: 1000px; margin: 24px auto; font-size:13px;">
-            <script>
-              const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
-              if (navEntry && navEntry.type === 'reload') {{
-                window.location.replace('/');
-              }}
-            </script>
-            <div style="margin-bottom: 12px;">
-              <a href="/download/{token}" style="margin-right: 10px;">下載 Excel</a>
-              <a href="/report/{token}">下載 PDF</a>
-            </div>
-            <h2>預覽（完整班表）</h2>
-            {table_html}
-            <h2>班段統計</h2>
-            {charts_html}
-            <h2>職務統計</h2>
-            {skill_html}
-            <h2>拉班次數</h2>
-            {pull_html}
-            <p><a href="/">回首頁</a></p>
-          </body>
-        </html>
-        """
+    return templates.TemplateResponse(
+        "preview.html",
+        {
+            "request": request,
+            "token": token,
+            "table_html": table_html,
+            "charts_html": charts_html,
+            "skill_html": skill_html,
+            "pull_html": pull_html,
+        },
     )
 
 
@@ -808,3 +627,12 @@ def report_pdf(token: str):
     c.save()
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=report.pdf"})
+
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)

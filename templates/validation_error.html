@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>輸入資料錯誤</title>
+    <link rel="icon" href="/static/favicon.png" />
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="card">
+        <h1>輸入資料錯誤</h1>
+        <p class="error">請修正後再重新上傳。</p>
+        <pre style="white-space:pre-wrap;border:1px solid #d6deea;border-radius:10px;padding:12px;background:#f8fbff;">{{ message }}</pre>
+        <div class="toolbar">
+          <a class="btn" href="/">回首頁</a>
+        </div>
+      </div>
+    </div>
+    <script>
+      alert({{ message|tojson }});
+    </script>
+  </body>
+</html>
