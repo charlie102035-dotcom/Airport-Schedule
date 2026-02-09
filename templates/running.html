@@ -5,24 +5,53 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Running</title>
     <link rel="icon" href="/static/favicon.png" />
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/app.css?v=20260210q" />
   </head>
-  <body>
-    <div class="container">
-      <div class="card">
-        <h1>Running...</h1>
-        <div class="progress-wrap">
-          <div id="progressBar" class="progress-bar"></div>
-        </div>
-        <div id="progressText" style="margin-top:8px;color:#4b5563;"></div>
-        <div id="errorText" class="error"></div>
-      </div>
+  <body class="home-page app-page running-page">
+    <div class="geo-bg" aria-hidden="true">
+      <span class="geo-line geo-line-a"></span>
+      <span class="geo-line geo-line-b"></span>
+      <span class="geo-line geo-line-c"></span>
+      <span class="geo-line geo-line-d"></span>
+      <span class="geo-line geo-line-e"></span>
+      <span class="geo-poly geo-poly-a"></span>
+      <span class="geo-poly geo-poly-b"></span>
+      <span class="geo-poly geo-poly-c"></span>
+      <span class="geo-poly geo-poly-d"></span>
+      <span class="geo-poly geo-poly-e"></span>
+      <span class="geo-poly geo-poly-f"></span>
+      <span class="geo-poly geo-poly-g"></span>
+      <span class="geo-poly geo-poly-h"></span>
+      <span class="geo-poly geo-poly-i"></span>
+    </div>
+
+    <div class="container home-shell app-shell">
+      <main class="home-layout">
+        <section class="home-form-card app-card">
+          <header class="app-header">
+            <div>
+              <div class="hero-kicker">TSA SHIFT ENGINE</div>
+              <h1 class="app-title">Running</h1>
+              <p class="lead app-subtitle">目前任務：{{ mode_label }}</p>
+            </div>
+            <a class="btn" href="/monthly">回首頁</a>
+          </header>
+
+          <div class="app-progress-card">
+            <div class="progress-wrap progress-wrap-animated">
+              <div id="progressBar" class="progress-bar progress-bar-live"></div>
+            </div>
+            <div id="progressText" class="progress-meta"></div>
+            <div id="errorText" class="error error-box"></div>
+          </div>
+        </section>
+      </main>
     </div>
 
     <script>
       const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
       if (navEntry && navEntry.type === 'reload') {
-        window.location.replace('/');
+        window.location.replace('/monthly');
       }
 
       const token = '{{ token }}';
@@ -30,33 +59,101 @@
       const txt = document.getElementById('progressText');
       const err = document.getElementById('errorText');
 
-      async function poll() {
-        const resp = await fetch('/progress/' + token);
-        const data = await resp.json();
-        if (data.status === 'error') {
-          err.textContent = data.message || 'Run failed.';
+      let backendPct = 0;
+      let targetPct = 0;
+      let shownPct = 0;
+      let etaSec = null;
+      let donePending = false;
+      let failed = false;
+      let redirecting = false;
+      let lastFrameTs = performance.now();
+
+      function clamp(v, min, max) {
+        return Math.max(min, Math.min(max, v));
+      }
+
+      function showError(message) {
+        err.textContent = message;
+        err.classList.add('show');
+      }
+
+      function clearError() {
+        err.textContent = '';
+        err.classList.remove('show');
+      }
+
+      function ingestProgress(data) {
+        const rawPct = clamp((Number(data.progress) || 0) * 100, 0, 100);
+        backendPct = Math.max(backendPct, rawPct);
+
+        const nextEta = Number(data.eta_sec);
+        etaSec = Number.isFinite(nextEta) ? Math.max(0, nextEta) : null;
+
+        if (data.status === 'done') {
+          donePending = true;
+          targetPct = 100;
+          etaSec = null;
           return;
         }
+        targetPct = Math.max(targetPct, Math.min(99.4, backendPct));
+      }
 
-        const pct = Math.floor((data.progress || 0) * 100);
-        bar.style.width = pct + '%';
-        const eta = data.eta_sec;
+      function renderMeta() {
+        const pct = Math.floor(shownPct);
         let etaText = '';
-        if (eta !== null && eta !== undefined) {
-          const total = Math.max(0, Math.floor(eta));
+        if (etaSec !== null && !donePending) {
+          const total = Math.max(0, Math.floor(etaSec));
           const mm = Math.floor(total / 60);
           const ss = total % 60;
           etaText = ' | ETA ' + mm + 'm ' + ss + 's';
         }
-        txt.textContent = 'Progress ' + pct + '%' + etaText;
+        const finishingText = donePending && shownPct < 99.6 ? ' | finishing...' : '';
+        txt.textContent = 'Progress ' + pct + '%' + etaText + finishingText;
+      }
 
-        if (data.status === 'done') {
+      function animateProgress(ts) {
+        const dt = Math.min(80, Math.max(8, ts - lastFrameTs));
+        lastFrameTs = ts;
+        const gap = targetPct - shownPct;
+
+        if (gap > 0.02) {
+          const speed = donePending
+            ? Math.max(120, gap * 9.5)
+            : Math.max(16, Math.min(70, 9 + gap * 3.6));
+          shownPct = Math.min(targetPct, shownPct + (speed * dt) / 1000);
+          bar.style.width = shownPct.toFixed(2) + '%';
+        }
+
+        renderMeta();
+
+        if (donePending && shownPct >= 99.6 && !redirecting) {
+          redirecting = true;
           window.location.href = '/preview/' + token;
           return;
         }
-        setTimeout(poll, 500);
+        requestAnimationFrame(animateProgress);
       }
 
+      async function poll() {
+        if (failed || redirecting) return;
+        try {
+          const resp = await fetch('/progress/' + token, { cache: 'no-store' });
+          const data = await resp.json();
+          if (!resp.ok || data.status === 'error') {
+            failed = true;
+            showError(data.message || 'Run failed.');
+            return;
+          }
+          clearError();
+          ingestProgress(data);
+        } catch (e) {
+          showError('連線不穩，正在重試...');
+        }
+        setTimeout(poll, 420);
+      }
+
+      renderMeta();
+      requestAnimationFrame(animateProgress);
       poll();
     </script>
   </body>

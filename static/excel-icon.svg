@@ -1,0 +1,21 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="sheetGreen" x1="28" y1="22" x2="228" y2="236" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#39A85A"/>
+      <stop offset="1" stop-color="#238A45"/>
+    </linearGradient>
+    <linearGradient id="badgeGreen" x1="22" y1="54" x2="154" y2="130" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#39A85A"/>
+      <stop offset="1" stop-color="#2A944B"/>
+    </linearGradient>
+  </defs>
+  <path d="M54 20H160L230 90V218C230 228.493 221.493 237 211 237H54C43.5066 237 35 228.493 35 218V39C35 28.5066 43.5066 20 54 20Z" fill="url(#sheetGreen)"/>
+  <path d="M160 20V72C160 82.4934 168.507 91 179 91H230" fill="#2D9850"/>
+  <rect x="48" y="33" width="168" height="191" rx="8" fill="#F4FFF8"/>
+  <rect x="23" y="54" width="132" height="86" rx="14" fill="url(#badgeGreen)"/>
+  <text x="89" y="107" text-anchor="middle" font-family="Arial, sans-serif" font-size="42" font-weight="700" fill="white">XLSX</text>
+  <rect x="66" y="116" width="132" height="16" rx="4" fill="#2F9C50" opacity="0.85"/>
+  <rect x="66" y="142" width="132" height="16" rx="4" fill="#2F9C50" opacity="0.85"/>
+  <rect x="66" y="168" width="132" height="16" rx="4" fill="#2F9C50" opacity="0.85"/>
+  <rect x="66" y="194" width="132" height="16" rx="4" fill="#2F9C50" opacity="0.85"/>
+</svg>

@@ -5,21 +5,41 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>輸入資料錯誤</title>
     <link rel="icon" href="/static/favicon.png" />
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/app.css?v=20260210q" />
   </head>
-  <body>
-    <div class="container">
-      <div class="card">
-        <h1>輸入資料錯誤</h1>
-        <p class="error">請修正後再重新上傳。</p>
-        <pre style="white-space:pre-wrap;border:1px solid #d6deea;border-radius:10px;padding:12px;background:#f8fbff;">{{ message }}</pre>
-        <div class="toolbar">
-          <a class="btn" href="/">回首頁</a>
-        </div>
-      </div>
+  <body class="home-page app-page validation-page">
+    <div class="geo-bg" aria-hidden="true">
+      <span class="geo-line geo-line-a"></span>
+      <span class="geo-line geo-line-b"></span>
+      <span class="geo-line geo-line-c"></span>
+      <span class="geo-line geo-line-d"></span>
+      <span class="geo-line geo-line-e"></span>
+      <span class="geo-poly geo-poly-a"></span>
+      <span class="geo-poly geo-poly-b"></span>
+      <span class="geo-poly geo-poly-c"></span>
+      <span class="geo-poly geo-poly-d"></span>
+      <span class="geo-poly geo-poly-e"></span>
+      <span class="geo-poly geo-poly-f"></span>
+      <span class="geo-poly geo-poly-g"></span>
+      <span class="geo-poly geo-poly-h"></span>
+      <span class="geo-poly geo-poly-i"></span>
     </div>
-    <script>
-      alert({{ message|tojson }});
-    </script>
+
+    <div class="container home-shell app-shell">
+      <main class="home-layout">
+        <section class="home-form-card app-card">
+          <header class="app-header">
+            <div>
+              <div class="hero-kicker">TSA SHIFT ENGINE</div>
+              <h1 class="app-title">輸入資料錯誤</h1>
+              <p class="lead app-subtitle">請修正後再重新上傳。</p>
+            </div>
+            <a class="btn" href="/monthly">回首頁</a>
+          </header>
+
+          <pre class="error-pre">{{ message }}</pre>
+        </section>
+      </main>
+    </div>
   </body>
 </html>

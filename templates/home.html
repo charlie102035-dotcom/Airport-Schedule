@@ -5,106 +5,215 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>TSA班表生成器</title>
     <link rel="icon" href="/static/favicon.png" />
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/app.css?v=20260210q" />
   </head>
-  <body>
-    <div class="container">
-      <div class="card">
-        <h1>TSA班表生成器</h1>
-        <div class="toolbar">
-          <a class="btn" href="{{ template_url }}" target="_blank" rel="noopener noreferrer">下載模板</a>
-          <a class="btn" href="{{ manual_url }}" target="_blank" rel="noopener noreferrer">使用說明書</a>
-        </div>
+  <body class="home-page">
+    <div class="home-orb home-orb-a" aria-hidden="true"></div>
+    <div class="home-orb home-orb-b" aria-hidden="true"></div>
+    <div class="geo-bg" aria-hidden="true">
+      <span class="geo-line geo-line-a"></span>
+      <span class="geo-line geo-line-b"></span>
+      <span class="geo-line geo-line-c"></span>
+      <span class="geo-line geo-line-d"></span>
+      <span class="geo-line geo-line-e"></span>
+      <span class="geo-poly geo-poly-a"></span>
+      <span class="geo-poly geo-poly-b"></span>
+      <span class="geo-poly geo-poly-c"></span>
+      <span class="geo-poly geo-poly-d"></span>
+      <span class="geo-poly geo-poly-e"></span>
+      <span class="geo-poly geo-poly-f"></span>
+      <span class="geo-poly geo-poly-g"></span>
+      <span class="geo-poly geo-poly-h"></span>
+      <span class="geo-poly geo-poly-i"></span>
+    </div>
 
-        <form action="/run" method="post" enctype="multipart/form-data">
-          <div class="field">
-            <label for="file">Excel file (.xlsx)</label>
-            <div id="fileWrap" class="file-input-wrap">
-              <input id="file" type="file" name="file" accept=".xlsx" required />
+    <div class="container home-shell">
+      <main class="home-layout">
+        <section class="home-form-card">
+          <header class="home-topbar">
+            <div class="home-brand">
+              <div class="hero-kicker">TSA SHIFT ENGINE</div>
+              <h1>TSA班表生成器</h1>
             </div>
-          </div>
+            <div class="home-top-actions">
+              <a class="btn" href="{{ template_url }}" target="_blank" rel="noopener noreferrer">下載模板</a>
+            </div>
+          </header>
 
-          <div class="field">
-            <label for="priorityMode">套用分隊</label>
-            <select name="priority_mode" id="priorityMode">
-              <option value="team1">一分隊</option>
-              <option value="team2">二分隊</option>
-              <option value="team3">三分隊</option>
-              <option value="custom">客製化</option>
-            </select>
-          </div>
-
-          <div id="customWrap" class="panel" style="display:none;">
-            <div style="margin-bottom: 6px; font-weight: 700;">自訂模組啟用</div>
-            <div class="flex">
-              <div>
-                <div class="muted">Activated</div>
-                <ul id="customList" class="list-clean">
-                  <li data-key="fairness" class="list-item">
-                    <input type="checkbox" class="modCheck" checked />
-                    <span>職務次數平均</span>
-                  </li>
-                  <li data-key="shift_count" class="list-item">
-                    <input type="checkbox" class="modCheck" checked />
-                    <span>班段次數平均</span>
-                  </li>
-                </ul>
-              </div>
-              <div>
-                <div class="muted">Inactivated</div>
-                <ul id="inactiveList" class="list-clean" style="min-height:24px;border:1px dashed #d0d9e6;padding:6px;border-radius:8px;"></ul>
+          <form action="/run" method="post" enctype="multipart/form-data" class="home-form">
+            <div class="wizard-progress-wrap">
+              <div class="wizard-progress" aria-hidden="true">
+                <div class="wizard-dot active" data-step-indicator="0">
+                  <span class="wizard-index">1</span>
+                  <span class="wizard-text">Select Mode</span>
+                </div>
+                <div class="wizard-dot" data-step-indicator="1">
+                  <span class="wizard-index">2</span>
+                  <span class="wizard-text">Upload</span>
+                </div>
+                <div class="wizard-dot" data-step-indicator="2">
+                  <span class="wizard-index">3</span>
+                  <span class="wizard-text">Run</span>
+                </div>
               </div>
             </div>
-          </div>
 
-          <input type="hidden" name="custom_order" id="customOrder" value="fairness,shift_count" />
+            <div class="wizard-viewport">
+              <div class="wizard-track" id="wizardTrack">
+                <section class="wizard-step">
+                  <div class="mode-team-grid">
+                    <div class="home-section mode-block">
+                      <div class="mode-selector" id="modeSelector" role="radiogroup" aria-label="排程模式">
+                        <div class="mode-selector-mask" id="modeSelectorMask" aria-hidden="true"></div>
+                        <button
+                          type="button"
+                          class="mode-option {% if default_mode != 'departure' %}is-active{% endif %}"
+                          data-value="monthly"
+                        >
+                          月班表
+                        </button>
+                        <button
+                          type="button"
+                          class="mode-option {% if default_mode == 'departure' %}is-active{% endif %}"
+                          data-value="departure"
+                        >
+                          出境勤務表
+                        </button>
+                      </div>
+                      <input
+                        type="hidden"
+                        name="schedule_mode"
+                        id="scheduleMode"
+                        value="{% if default_mode == 'departure' %}departure{% else %}monthly{% endif %}"
+                      />
+                    </div>
 
-          <div id="scoreWrap" class="panel" style="display:none;">
-            <div style="margin-bottom: 6px; font-weight: 700;">我們最注重......（由上到下，倍率 3/2/1）</div>
-            <ul id="scoreOrderList" class="list-clean">
-              <li data-key="fairness" class="list-item">
-                <span style="width: 150px;">職務次數平均</span>
-                <button type="button" class="btn upBtn">↑</button>
-                <button type="button" class="btn downBtn">↓</button>
-              </li>
-              <li data-key="shift" class="list-item">
-                <span style="width: 150px;">班段次數平均</span>
-                <button type="button" class="btn upBtn">↑</button>
-                <button type="button" class="btn downBtn">↓</button>
-              </li>
-              <li data-key="pull" class="list-item">
-                <span style="width: 150px;">拉班次數平均</span>
-                <button type="button" class="btn upBtn">↑</button>
-                <button type="button" class="btn downBtn">↓</button>
-              </li>
-            </ul>
-            <input type="hidden" name="score_order" id="scoreOrder" value="fairness,shift,pull" />
-          </div>
+                    <div class="home-section team-block" id="teamWrap">
+                      <label class="section-label">套用分隊</label>
+                      <div class="team-selector" id="teamSelector" role="radiogroup" aria-label="套用分隊">
+                        <div class="team-selector-mask" id="teamSelectorMask" aria-hidden="true"></div>
+                        <button type="button" class="team-option is-active" data-value="team1">一分隊</button>
+                        <button type="button" class="team-option" data-value="team2">二分隊</button>
+                        <button type="button" class="team-option" data-value="team3">三分隊</button>
+                        <button type="button" class="team-option" data-value="custom">客製化</button>
+                      </div>
+                      <div class="team-disabled-hint" id="teamDisabledHint">僅月班表可用</div>
+                      <input type="hidden" name="priority_mode" id="priorityMode" value="team1" />
+                      <div id="teamCustomInline" class="team-custom-inline" aria-hidden="true">
+                        <div id="customWrap" class="custom-inline-block">
+                          <div class="custom-inline-title">自訂模組</div>
+                          <div class="flex module-columns compact-columns">
+                            <div class="module-col">
+                              <div class="module-col-title">Activated</div>
+                              <ul id="customList" class="list-clean">
+                                <li data-key="fairness" class="list-item">
+                                  <input type="checkbox" class="modCheck" checked />
+                                  <span>職務次數平均</span>
+                                </li>
+                                <li data-key="shift_count" class="list-item">
+                                  <input type="checkbox" class="modCheck" checked />
+                                  <span>班段次數平均</span>
+                                </li>
+                              </ul>
+                            </div>
+                            <div class="module-col">
+                              <div class="module-col-title">Inactivated</div>
+                              <ul id="inactiveList" class="list-clean inactive-list module-inactive"></ul>
+                            </div>
+                          </div>
+                        </div>
+                        <input type="hidden" name="custom_order" id="customOrder" value="fairness,shift_count" />
 
-          <button class="btn btn-primary" type="submit">Run</button>
-        </form>
+                        <div id="scoreWrap" class="custom-inline-block score-inline-block">
+                          <div class="custom-inline-title">評分順序（由上到下 3/2/1）</div>
+                          <ul id="scoreOrderList" class="list-clean compact-score-list">
+                            <li data-key="fairness" class="list-item">
+                              <span class="score-name">職務次數平均</span>
+                              <button type="button" class="btn upBtn">↑</button>
+                              <button type="button" class="btn downBtn">↓</button>
+                            </li>
+                            <li data-key="shift" class="list-item">
+                              <span class="score-name">班段次數平均</span>
+                              <button type="button" class="btn upBtn">↑</button>
+                              <button type="button" class="btn downBtn">↓</button>
+                            </li>
+                            <li data-key="pull" class="list-item">
+                              <span class="score-name">拉班次數平均</span>
+                              <button type="button" class="btn upBtn">↑</button>
+                              <button type="button" class="btn downBtn">↓</button>
+                            </li>
+                          </ul>
+                          <input type="hidden" name="score_order" id="scoreOrder" value="fairness,shift,pull" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
 
-        <div class="manual-preview">
-          <h2>說明書預覽</h2>
-          {% if manual_preview_url %}
-          <div
-            id="manualPages"
-            class="manual-pages"
-            data-pdf-url="{{ manual_preview_url }}"
-          ></div>
-          {% else %}
-          <div class="manual-placeholder">
-            尚未找到可預覽的 PDF。請將說明書檔案放到 <code>static/manual.pdf</code>。
-          </div>
-          {% endif %}
+                  <div class="wizard-actions">
+                    <button class="btn btn-primary" type="button" id="modeNextBtn">完成並下一步</button>
+                  </div>
+                </section>
+
+                <section class="wizard-step">
+                  <div class="home-section upload-section">
+                    <label class="section-label" for="file">Upload</label>
+                    <div id="fileWrap" class="file-input-wrap upload-wrap">
+                      <div class="upload-visual">
+                        <img class="upload-icon" src="/static/excel-icon.svg" alt="Excel" />
+                      </div>
+                      <div class="upload-caption">選擇 Excel 檔案</div>
+                      <div class="upload-file-name" id="uploadFileName">尚未選擇檔案</div>
+                      <input id="file" type="file" name="file" accept=".xlsx" required />
+                    </div>
+                  </div>
+                  <div class="wizard-actions">
+                    <button class="btn" type="button" data-wizard-back="0">上一步</button>
+                    <button class="btn btn-primary" type="button" id="uploadNextBtn" disabled>完成並下一步</button>
+                  </div>
+                </section>
+
+                <section class="wizard-step wizard-step-run">
+                  <div class="wizard-actions run-actions">
+                    <button class="btn" type="button" data-wizard-back="1">上一步</button>
+                  </div>
+                  <div class="run-center">
+                    <div class="run-stage">
+                      <button class="btn btn-primary run-giant" type="submit">Run</button>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </form>
+        </section>
+      </main>
+
+      <section class="manual-preview home-manual-card">
+        <h2>使用說明</h2>
+        {% if manual_preview_url %}
+        <div id="manualPages" class="manual-pages" data-pdf-url="{{ manual_preview_url }}"></div>
+        {% else %}
+        <div class="manual-placeholder">
+          尚未找到可預覽的 PDF。請將說明書檔案放到 <code>static/manual.pdf</code>。
         </div>
-      </div>
+        {% endif %}
+      </section>
     </div>
 
     <script>
-      const modeSel = document.getElementById('priorityMode');
+      const scheduleModeInput = document.getElementById('scheduleMode');
+      const modeSelector = document.getElementById('modeSelector');
+      const modeSelectorMask = document.getElementById('modeSelectorMask');
+      const modeOptions = Array.from(document.querySelectorAll('.mode-option'));
+      const priorityModeInput = document.getElementById('priorityMode');
+      const teamWrap = document.getElementById('teamWrap');
+      const teamSelector = document.getElementById('teamSelector');
+      const teamSelectorMask = document.getElementById('teamSelectorMask');
+      const teamOptions = Array.from(document.querySelectorAll('.team-option'));
+      const teamDisabledHint = document.getElementById('teamDisabledHint');
       const customWrap = document.getElementById('customWrap');
       const scoreWrap = document.getElementById('scoreWrap');
+      const teamCustomInline = document.getElementById('teamCustomInline');
       const customList = document.getElementById('customList');
       const inactiveList = document.getElementById('inactiveList');
       const customOrder = document.getElementById('customOrder');
@@ -112,6 +221,16 @@
       const scoreOrder = document.getElementById('scoreOrder');
       const fileInput = document.getElementById('file');
       const fileWrap = document.getElementById('fileWrap');
+      const uploadFileName = document.getElementById('uploadFileName');
+      const wizardTrack = document.getElementById('wizardTrack');
+      const wizardProgress = document.querySelector('.wizard-progress');
+      const modeNextBtn = document.getElementById('modeNextBtn');
+      const uploadNextBtn = document.getElementById('uploadNextBtn');
+      const wizardDots = Array.from(document.querySelectorAll('[data-step-indicator]'));
+      const wizardBackBtns = Array.from(document.querySelectorAll('[data-wizard-back]'));
+      let wizardStep = 0;
+      let uiReady = false;
+      let uploadAdvanceTimer = null;
 
       function animateListFlip(listEl, moveAction) {
         const items = Array.from(listEl.querySelectorAll('li'));
@@ -138,6 +257,10 @@
         });
       }
 
+      function getScheduleMode() {
+        return scheduleModeInput.value || 'monthly';
+      }
+
       function syncOrder() {
         const keys = Array.from(customList.querySelectorAll('li')).map(li => li.dataset.key);
         customOrder.value = keys.join(',');
@@ -148,14 +271,141 @@
         scoreOrder.value = keys.join(',');
       }
 
-      function syncModeVisibility() {
-        const isCustom = modeSel.value === 'custom';
-        customWrap.style.display = isCustom ? 'block' : 'none';
-        scoreWrap.style.display = isCustom ? 'block' : 'none';
+      function syncModeMask() {
+        const active = modeOptions.find((opt) => opt.classList.contains('is-active'));
+        if (!active) return;
+        const y = active.offsetTop;
+        modeSelectorMask.style.height = `${active.offsetHeight}px`;
+        modeSelectorMask.style.width = `${active.offsetWidth}px`;
+        modeSelectorMask.style.transform = `translateY(${y}px)`;
       }
 
-      modeSel.addEventListener('change', syncModeVisibility);
-      syncModeVisibility();
+      function syncModeSelection() {
+        const current = getScheduleMode();
+        modeOptions.forEach((opt) => {
+          opt.classList.toggle('is-active', opt.dataset.value === current);
+        });
+        syncModeMask();
+      }
+
+      function syncTeamMask() {
+        const active = teamOptions.find((opt) => opt.classList.contains('is-active'));
+        if (!active) return;
+        const x = active.offsetLeft;
+        teamSelectorMask.style.width = `${active.offsetWidth}px`;
+        teamSelectorMask.style.transform = `translateX(${x}px)`;
+      }
+
+      function syncTeamSelection() {
+        const current = priorityModeInput.value;
+        teamOptions.forEach((opt) => {
+          opt.classList.toggle('is-active', opt.dataset.value === current);
+        });
+        syncTeamMask();
+      }
+
+      function setCustomInlineOpen(isOpen, instant = false) {
+        const el = teamCustomInline;
+        if (!el) return;
+
+        el.setAttribute('aria-hidden', String(!isOpen));
+
+        if (isOpen) {
+          el.classList.add('is-open');
+          const targetHeight = el.scrollHeight;
+          if (instant) {
+            el.style.maxHeight = `${targetHeight}px`;
+            return;
+          }
+          el.style.maxHeight = '0px';
+          requestAnimationFrame(() => {
+            el.style.maxHeight = `${targetHeight}px`;
+          });
+          return;
+        }
+
+        if (instant) {
+          el.classList.remove('is-open');
+          el.style.maxHeight = '0px';
+          return;
+        }
+
+        const currentHeight = el.scrollHeight;
+        el.style.maxHeight = `${currentHeight}px`;
+        requestAnimationFrame(() => {
+          el.style.maxHeight = '0px';
+          el.classList.remove('is-open');
+        });
+      }
+
+      teamCustomInline.addEventListener('transitionend', (e) => {
+        if (e.propertyName !== 'max-height') return;
+        if (teamCustomInline.classList.contains('is-open')) {
+          teamCustomInline.style.maxHeight = `${teamCustomInline.scrollHeight}px`;
+        }
+      });
+
+      function syncModeVisibility() {
+        const mode = getScheduleMode();
+        const isMonthly = mode === 'monthly';
+
+        if (!isMonthly && priorityModeInput.value === 'custom') {
+          priorityModeInput.value = 'team1';
+          syncTeamSelection();
+        }
+
+        teamWrap.classList.toggle('is-disabled', !isMonthly);
+        teamDisabledHint.classList.toggle('show', !isMonthly);
+
+        const isCustom = isMonthly && priorityModeInput.value === 'custom';
+        setCustomInlineOpen(isCustom, !uiReady);
+        customWrap.setAttribute('aria-hidden', String(!isCustom));
+        scoreWrap.setAttribute('aria-hidden', String(!isCustom));
+
+        requestAnimationFrame(() => {
+          syncModeMask();
+          syncTeamMask();
+        });
+      }
+
+      function setWizardStep(stepIndex) {
+        wizardStep = Math.max(0, Math.min(2, stepIndex));
+        wizardTrack.style.transform = `translateX(-${wizardStep * 100}%)`;
+        if (wizardProgress) {
+          const fill = (wizardStep / 2) * 67;
+          wizardProgress.style.setProperty('--wizard-fill', `${fill}%`);
+        }
+
+        wizardDots.forEach((dot, idx) => {
+          dot.classList.toggle('active', idx === wizardStep);
+          dot.classList.toggle('done', idx < wizardStep);
+        });
+      }
+
+      function canProceedUpload() {
+        return !!(fileInput.files && fileInput.files[0]);
+      }
+
+      function syncUploadStepState() {
+        uploadNextBtn.disabled = !canProceedUpload();
+      }
+
+      modeOptions.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          scheduleModeInput.value = btn.dataset.value || 'monthly';
+          syncModeSelection();
+          syncModeVisibility();
+        });
+      });
+
+      teamOptions.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          if (teamWrap.classList.contains('is-disabled')) return;
+          priorityModeInput.value = btn.dataset.value || 'team1';
+          syncTeamSelection();
+          syncModeVisibility();
+        });
+      });
 
       customWrap.addEventListener('change', (e) => {
         const target = e.target;
@@ -195,22 +445,68 @@
         syncScoreOrder();
       });
 
-      syncOrder();
-      syncScoreOrder();
+      modeNextBtn.addEventListener('click', () => {
+        setWizardStep(1);
+      });
+
+      uploadNextBtn.addEventListener('click', () => {
+        if (!canProceedUpload()) return;
+        setWizardStep(2);
+      });
+
+      wizardBackBtns.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const backTo = Number(btn.dataset.wizardBack);
+          setWizardStep(backTo);
+        });
+      });
 
       fileInput.addEventListener('change', () => {
         const f = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+        if (uploadAdvanceTimer) {
+          clearTimeout(uploadAdvanceTimer);
+          uploadAdvanceTimer = null;
+        }
         if (!f) {
           fileWrap.classList.remove('success');
+          fileWrap.classList.remove('is-ready');
+          uploadFileName.textContent = '尚未選擇檔案';
+          syncUploadStepState();
           return;
         }
 
         fileWrap.classList.add('success');
+        fileWrap.classList.add('is-ready');
+        uploadFileName.textContent = f.name;
+        syncUploadStepState();
 
         fileWrap.classList.remove('pulse-once');
         void fileWrap.offsetWidth;
         fileWrap.classList.add('pulse-once');
+
+        uploadAdvanceTimer = setTimeout(() => {
+          if (canProceedUpload() && wizardStep === 1) {
+            setWizardStep(2);
+          }
+        }, 520);
       });
+
+      window.addEventListener('resize', () => {
+        syncModeMask();
+        syncTeamMask();
+        if (teamCustomInline.classList.contains('is-open')) {
+          teamCustomInline.style.maxHeight = `${teamCustomInline.scrollHeight}px`;
+        }
+      });
+
+      syncModeSelection();
+      syncOrder();
+      syncScoreOrder();
+      syncTeamSelection();
+      syncModeVisibility();
+      syncUploadStepState();
+      setWizardStep(0);
+      uiReady = true;
     </script>
     {% if manual_preview_url %}
     <script type="module">
@@ -221,12 +517,15 @@
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
         const loadingTask = pdfjsLib.getDocument(pdfUrl);
         loadingTask.promise.then(async (pdf) => {
-          for (let i = 1; i <= pdf.numPages; i++) {
+          const startPage = pdf.numPages > 1 ? 2 : 1;
+          for (let i = startPage; i <= pdf.numPages; i++) {
             const page = await pdf.getPage(i);
             const viewport = page.getViewport({ scale: 1 });
             const containerWidth = Math.max(320, wrap.clientWidth - 24);
             const scale = containerWidth / viewport.width;
             const scaledViewport = page.getViewport({ scale });
+            const outputScale = Math.min(2.5, Math.max(1.5, window.devicePixelRatio || 1));
+            const renderViewport = page.getViewport({ scale: scale * outputScale });
 
             const pageCard = document.createElement('div');
             pageCard.className = 'manual-page-card';
@@ -234,15 +533,19 @@
             const canvas = document.createElement('canvas');
             canvas.className = 'manual-canvas';
             const context = canvas.getContext('2d');
-            canvas.width = Math.floor(scaledViewport.width);
-            canvas.height = Math.floor(scaledViewport.height);
+            canvas.width = Math.floor(renderViewport.width);
+            canvas.height = Math.floor(renderViewport.height);
+            canvas.style.width = `${Math.floor(scaledViewport.width)}px`;
+            canvas.style.height = `${Math.floor(scaledViewport.height)}px`;
             pageCard.appendChild(canvas);
             wrap.appendChild(pageCard);
 
-            await page.render({ canvasContext: context, viewport: scaledViewport }).promise;
+            context.imageSmoothingEnabled = true;
+            context.imageSmoothingQuality = 'high';
+            await page.render({ canvasContext: context, viewport: renderViewport }).promise;
           }
         }).catch((err) => {
-          wrap.innerHTML = '<div class="manual-placeholder">PDF 載入失敗，請改用上方「使用說明書」按鈕開啟。</div>';
+          wrap.innerHTML = '<div class="manual-placeholder">PDF 載入失敗，請稍後重整頁面再試。</div>';
           console.error(err);
         });
       }

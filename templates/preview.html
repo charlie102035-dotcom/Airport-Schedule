@@ -5,38 +5,91 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>預覽結果</title>
     <link rel="icon" href="/static/favicon.png" />
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/app.css?v=20260210q" />
   </head>
-  <body>
-    <div class="container" style="max-width: 1180px;">
-      <div class="card">
-        <script>
-          const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
-          if (navEntry && navEntry.type === 'reload') {
-            window.location.replace('/');
-          }
-        </script>
+  <body class="home-page app-page preview-page">
+    <div class="geo-bg" aria-hidden="true">
+      <span class="geo-line geo-line-a"></span>
+      <span class="geo-line geo-line-b"></span>
+      <span class="geo-line geo-line-c"></span>
+      <span class="geo-line geo-line-d"></span>
+      <span class="geo-line geo-line-e"></span>
+      <span class="geo-poly geo-poly-a"></span>
+      <span class="geo-poly geo-poly-b"></span>
+      <span class="geo-poly geo-poly-c"></span>
+      <span class="geo-poly geo-poly-d"></span>
+      <span class="geo-poly geo-poly-e"></span>
+      <span class="geo-poly geo-poly-f"></span>
+      <span class="geo-poly geo-poly-g"></span>
+      <span class="geo-poly geo-poly-h"></span>
+      <span class="geo-poly geo-poly-i"></span>
+    </div>
 
-        <div class="toolbar">
-          <a class="btn btn-primary" href="/download/{{ token }}">下載 Excel</a>
-          <a class="btn" href="/report/{{ token }}">下載 PDF</a>
-          <a class="btn" href="/">回首頁</a>
-        </div>
+    <div class="container home-shell app-shell app-shell-wide">
+      <main class="home-layout">
+        <section class="home-form-card app-card">
+          <script>
+            const navEntry = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+            if (navEntry && navEntry.type === 'reload') {
+              window.location.replace('/monthly');
+            }
+          </script>
 
-        <h2>預覽（完整班表）</h2>
-        <div class="table-wrap">
-          {{ table_html | safe }}
-        </div>
+          <header class="app-header preview-header">
+            <div>
+              <div class="hero-kicker">TSA SHIFT ENGINE</div>
+              <h1 class="app-title">排班結果預覽</h1>
+            </div>
+            <div class="toolbar app-toolbar">
+              <a class="btn btn-primary" href="/download/{{ token }}">下載 Excel</a>
+              <a class="btn" href="/report/{{ token }}">下載 PDF</a>
+              <a class="btn" href="/monthly">回首頁</a>
+            </div>
+          </header>
 
-        <h2>班段統計</h2>
-        {{ charts_html | safe }}
+          <div class="section-card">
+            <h2>預覽（完整班表）</h2>
+            <div class="table-wrap">
+              {{ table_html | safe }}
+            </div>
+          </div>
 
-        <h2>職務統計</h2>
-        {{ skill_html | safe }}
+          {% if departure_work_html %}
+          <div class="section-card">
+            <h2>早晚班統計：總上勤時數</h2>
+            {{ departure_work_html | safe }}
+          </div>
+          {% endif %}
 
-        <h2>拉班次數</h2>
-        {{ pull_html | safe }}
-      </div>
+          {% if departure_auto_html %}
+          <div class="section-card">
+            <h2>早晚班統計：自動通關時數</h2>
+            {{ departure_auto_html | safe }}
+          </div>
+          {% endif %}
+
+          {% if charts_html %}
+          <div class="section-card">
+            <h2>班段統計</h2>
+            {{ charts_html | safe }}
+          </div>
+          {% endif %}
+
+          {% if skill_html %}
+          <div class="section-card">
+            <h2>職務統計</h2>
+            {{ skill_html | safe }}
+          </div>
+          {% endif %}
+
+          {% if pull_html %}
+          <div class="section-card">
+            <h2>拉班次數</h2>
+            {{ pull_html | safe }}
+          </div>
+          {% endif %}
+        </section>
+      </main>
     </div>
   </body>
 </html>

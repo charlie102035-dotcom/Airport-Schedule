@@ -4,13 +4,16 @@ import shutil
 import tempfile
 from pathlib import Path
 from functools import lru_cache
+import importlib
+import threading
 import time
 import uuid
 import html
 from openpyxl import load_workbook
+import pandas as pd
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from io import BytesIO
@@ -28,11 +31,166 @@ PROJECT_DIR = BASE_DIR.parent
 sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(PROJECT_DIR))
 
+
+_SCHEDULE_MODES: dict[str, dict] = {
+    "monthly": {
+        "label": "月班表",
+        "desc": "一個月前排下個月班表，重視整月公平與穩定。",
+        "run_kwargs": {
+            "search_best_roster": True,
+            "search_patience": 10,
+            "require_all_pulls_nonzero": False,
+            "rescue_fill": True,
+        },
+    },
+    "departure": {
+        "label": "出境勤務表",
+        "desc": "前一天排隔天出境勤務表，重視即時可用與快速收斂。",
+        "run_kwargs": {
+            "search_best_roster": True,
+            "search_patience": 5,
+            "require_all_pulls_nonzero": False,
+            "rescue_fill": True,
+        },
+    },
+}
+
+
+def _mode_key_or_default(mode: str | None) -> str:
+    key = str(mode or "").strip().lower()
+    return key if key in _SCHEDULE_MODES else "monthly"
+
+
 @lru_cache(maxsize=1)
 def _get_scheduler_funcs():
-    from 機場排班程式 import run_scheduler, validate_input_excel  # noqa: E402
+    import 機場排班程式 as monthly_mod  # noqa: E402
+    departure_mod = None
+    departure_import_error: Exception | None = None
+    try:
+        importlib.invalidate_caches()
+        departure_mod = importlib.import_module("departure_duty_scheduler")
+    except Exception as e:
+        departure_import_error = e
 
-    return run_scheduler, validate_input_excel
+    run_monthly = getattr(monthly_mod, "run_scheduler")
+    validate_monthly = getattr(monthly_mod, "validate_input_excel")
+
+    def validate_departure(input_excel_path: str) -> list[dict]:
+        if departure_import_error is not None:
+            return [
+                {
+                    "sheet": "Departure",
+                    "columns": [],
+                    "reason": f"departure_duty_scheduler import failed: {departure_import_error}",
+                }
+            ]
+        try:
+            assert departure_mod is not None
+            emp_df, dem_df = departure_mod.read_input(input_excel_path)
+            departure_mod.validate_input(emp_df, dem_df)
+            return []
+        except Exception as e:
+            return [{"sheet": "Departure", "columns": [], "reason": str(e)}]
+
+    def run_departure(
+        *,
+        input_excel_path: str,
+        output_excel_path: str | None = None,
+        progress_callback=None,
+        **kwargs,
+    ) -> dict:
+        if departure_import_error is not None:
+            raise RuntimeError(f"departure_duty_scheduler import failed: {departure_import_error}")
+        assert departure_mod is not None
+        out_path = str(output_excel_path or "")
+        if out_path.strip() == "":
+            raise ValueError("output_excel_path is required for departure mode.")
+
+        report_path = str(Path(out_path).with_name("departure_report.txt"))
+        settings = departure_mod.SolverSettings(
+            weight_last_hour_work=50,
+            weight_group_fairness=8,
+            weight_target_deviation=3,
+            weight_same_hour_consistency=12,
+            weight_single_slot_fragment=18,
+            weight_shortage_slot=100000,
+            auto_gate_max_slots=6,
+            max_consecutive_work_slots=6,
+            early_max_work_slots=14,
+            late_max_work_slots=15,
+            enforce_shift_work_caps=False,
+            weight_shift_cap_excess=30,
+            feasibility_mode="hard",
+            max_time_sec=30,
+        )
+
+        heartbeat_thread = None
+        heartbeat_stop = threading.Event()
+        # hard mode may fallback to allow_shortage, so reserve roughly 2x solve budget.
+        expected_sec = max(20, int(settings.max_time_sec) * 2 + 10)
+
+        if callable(progress_callback):
+            try:
+                progress_callback(1, 100)
+            except Exception:
+                pass
+
+            def _heartbeat() -> None:
+                start = time.time()
+                while not heartbeat_stop.wait(1.0):
+                    elapsed = max(0.0, time.time() - start)
+                    cur = min(99, max(1, int((elapsed / expected_sec) * 100)))
+                    try:
+                        progress_callback(cur, 100)
+                    except Exception:
+                        return
+
+            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+            heartbeat_thread.start()
+
+        try:
+            result = departure_mod.run_pipeline(
+                input_path=input_excel_path,
+                output_excel_path=out_path,
+                report_path=report_path,
+                settings=settings,
+                dry_run=False,
+                fallback_to_allow_shortage=False,
+            )
+        finally:
+            if heartbeat_thread is not None:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=0.2)
+
+        if callable(progress_callback):
+            try:
+                progress_callback(100, 100)
+            except Exception:
+                pass
+
+        all_covered = bool(result.get("all_covered", False))
+        total_shortage = int(result.get("total_shortage_slots", 0) or 0)
+        if not all_covered:
+            raise RuntimeError(
+                "出境勤務表存在開天窗，已依硬規則視為不可接受。"
+                f"status={result.get('status', '')}, shortage_slots={total_shortage}。"
+                f"請查看診斷報告：{report_path}"
+            )
+        score = 100.0 if all_covered else max(0.0, 100.0 - float(total_shortage))
+        departure_stats = _build_departure_chart_data(out_path)
+        return {
+            "tries": 1,
+            "best_score_100": score,
+            "chart_data": {"departure": departure_stats},
+            "mode_used": result.get("mode_used", ""),
+            "status": result.get("status", ""),
+            "total_shortage_slots": total_shortage,
+        }
+
+    return {
+        "monthly": {"run": run_monthly, "validate": validate_monthly},
+        "departure": {"run": run_departure, "validate": validate_departure},
+    }
 
 
 app = FastAPI(title="Airport Scheduler MVP")
@@ -51,6 +209,7 @@ def _store_result(
     tries: int,
     best_score_100: float,
     chart_data: dict,
+    mode: str,
 ) -> None:
     _RESULTS[token] = {
         "out_path": out_path,
@@ -58,6 +217,7 @@ def _store_result(
         "tries": tries,
         "best_score_100": best_score_100,
         "chart_data": chart_data,
+        "mode": _mode_key_or_default(mode),
         "ts": time.time(),
         "status": "done",
         "progress": 1.0,
@@ -81,7 +241,7 @@ def _esc(v) -> str:
     return html.escape(str(v if v is not None else ""), quote=True)
 
 
-def _init_progress(token: str, tmpdir: Path, min_tries: int) -> None:
+def _init_progress(token: str, tmpdir: Path, min_tries: int, mode: str) -> None:
     _RESULTS[token] = {
         "tmpdir": tmpdir,
         "ts": time.time(),
@@ -90,6 +250,7 @@ def _init_progress(token: str, tmpdir: Path, min_tries: int) -> None:
         "progress": 0.0,
         "tries": 0,
         "min_tries": int(min_tries),
+        "mode": _mode_key_or_default(mode),
     }
 
 
@@ -99,6 +260,7 @@ def _set_progress(token: str, current_try: int, max_tries: int) -> None:
         return
     data["ts"] = time.time()
     total = max(1, int(max_tries))
+    data["min_tries"] = total
     cur = max(0, int(current_try))
     data["tries"] = cur
     data["progress"] = min(1.0, cur / total)
@@ -153,6 +315,70 @@ def _hex_color(rgb) -> str:
         return ""
 
 
+def _shift_window_to_group(shift_window: str) -> str:
+    s = str(shift_window or "").strip()
+    if "-" in s:
+        start = s.split("-", 1)[0].strip()
+    else:
+        start = s
+    try:
+        h = int(str(start).split(":")[0])
+    except Exception:
+        return "Unknown"
+    if h in (5, 6):
+        return "Early"
+    if h in (7, 8):
+        return "Late"
+    return "Unknown"
+
+
+def _build_departure_chart_data(output_excel_path: str) -> dict:
+    empty = {"work": {"Early": [], "Late": []}, "auto": {"Early": [], "Late": []}}
+    try:
+        summary = pd.read_excel(output_excel_path, sheet_name="Summary")
+    except Exception:
+        return empty
+
+    req_cols = {"name", "shift_window", "worked_minutes", "auto_gate_minutes"}
+    if not req_cols.issubset(set(summary.columns)):
+        return empty
+
+    work = {"Early": [], "Late": []}
+    auto = {"Early": [], "Late": []}
+    for _, row in summary.iterrows():
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        grp = _shift_window_to_group(str(row.get("shift_window", "")))
+        if grp not in ("Early", "Late"):
+            continue
+        try:
+            worked_h = float(row.get("worked_minutes", 0) or 0) / 60.0
+        except Exception:
+            worked_h = 0.0
+        try:
+            auto_h = float(row.get("auto_gate_minutes", 0) or 0) / 60.0
+        except Exception:
+            auto_h = 0.0
+        has_auto_skill_raw = row.get("has_auto_gate_skill", 1)
+        has_auto_skill = False
+        if isinstance(has_auto_skill_raw, str):
+            has_auto_skill = has_auto_skill_raw.strip().lower() in {"1", "true", "yes", "y"}
+        else:
+            try:
+                has_auto_skill = bool(int(has_auto_skill_raw))
+            except Exception:
+                has_auto_skill = bool(has_auto_skill_raw)
+        work[grp].append((name, round(worked_h, 1)))
+        if has_auto_skill:
+            auto[grp].append((name, round(auto_h, 1)))
+
+    for grp in ("Early", "Late"):
+        work[grp].sort(key=lambda x: x[1], reverse=True)
+        auto[grp].sort(key=lambda x: x[1], reverse=True)
+    return {"work": work, "auto": auto}
+
+
 def _cleanup_expired_results() -> None:
     now = time.time()
     expired = [k for k, v in _RESULTS.items() if now - float(v.get("ts", 0)) > _RESULT_TTL_SEC]
@@ -190,17 +416,38 @@ def _find_manual_preview_url() -> str | None:
 
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
+def home():
+    return RedirectResponse(url="/monthly", status_code=307)
+
+
+def _render_scheduler_home(request: Request, default_mode: str = "monthly") -> HTMLResponse:
     manual_preview_url = _find_manual_preview_url()
-    return templates.TemplateResponse(
+    modes = [
+        {
+            "key": key,
+            "label": mode["label"],
+            "desc": mode["desc"],
+        }
+        for key, mode in _SCHEDULE_MODES.items()
+    ]
+    resp = templates.TemplateResponse(
         "home.html",
         {
             "request": request,
             "template_url": "https://drive.google.com/drive/folders/1mNXtRv5olbJQAGhnVy30mBoa8m4nTAJT?usp=sharing",
-            "manual_url": "https://drive.google.com/file/d/1ypcRSL7oebprND6yXXhVLAe_QJ2uxFD1/view?usp=share_link",
+            "manual_url": manual_preview_url or "/static/manual.pdf",
             "manual_preview_url": manual_preview_url,
+            "modes": modes,
+            "default_mode": _mode_key_or_default(default_mode),
         },
     )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/monthly", response_class=HTMLResponse)
+def monthly_home(request: Request):
+    return _render_scheduler_home(request, default_mode="monthly")
 
 
 @app.post("/run")
@@ -208,10 +455,13 @@ async def run(
     background_tasks: BackgroundTasks,
     request: Request,
     file: UploadFile = File(...),
+    schedule_mode: str = Form("monthly"),
     priority_mode: str = Form("team1"),
     custom_order: str = Form("fairness,shift_count"),
     score_order: str = Form("fairness,shift,pull"),
 ):
+    mode_key = _mode_key_or_default(schedule_mode)
+    mode_cfg = _SCHEDULE_MODES.get(mode_key, _SCHEDULE_MODES["monthly"])
     # 1) 基本檢查：副檔名
     filename = (file.filename or "").lower()
     if not filename.endswith(".xlsx"):
@@ -235,7 +485,10 @@ async def run(
             raise HTTPException(status_code=400, detail="File too large (max 10MB).")
 
         # 4.1) 輸入資料檢查：立即回報錯誤欄位並返回首頁
-        run_scheduler, validate_input_excel = _get_scheduler_funcs()
+        scheduler_funcs = _get_scheduler_funcs()
+        mode_funcs = scheduler_funcs.get(mode_key, scheduler_funcs["monthly"])
+        run_scheduler = mode_funcs["run"]
+        validate_input_excel = mode_funcs["validate"]
         validation_errors = validate_input_excel(str(in_path))
         if validation_errors:
             msg = _format_validation_errors(validation_errors)
@@ -250,31 +503,29 @@ async def run(
             )
 
         token = uuid.uuid4().hex
-        _init_progress(token, tmpdir, 100)
+        _init_progress(token, tmpdir, 100, mode_key)
 
         def _run_job() -> None:
             try:
                 def _cb(cur: int, mx: int) -> None:
                     _set_progress(token, cur, mx)
 
+                run_kwargs = mode_cfg.get("run_kwargs", {}) or {}
                 result = run_scheduler(
                     input_excel_path=str(in_path),
                     output_excel_path=str(out_path),
-                    search_best_roster=True,
-                    search_patience=10,
-                    require_all_pulls_nonzero=False,
                     debug=False,
                     progress_callback=_cb,
                     priority_mode=priority_mode,
                     custom_order=custom_order,
-                    rescue_fill=True,
                     score_order=score_order,
+                    **run_kwargs,
                 )
 
                 tries_used = int(result.get("tries", 0) or 0)
                 best_score = float(result.get("best_score_100", 0.0) or 0.0)
                 chart_data = result.get("chart_data", {}) or {}
-                _store_result(token, out_path, tmpdir, tries_used, best_score, chart_data)
+                _store_result(token, out_path, tmpdir, tries_used, best_score, chart_data, mode_key)
             except Exception as e:
                 _set_error(token, str(e))
 
@@ -285,6 +536,7 @@ async def run(
             {
                 "request": request,
                 "token": token,
+                "mode_label": mode_cfg["label"],
             },
         )
 
@@ -306,9 +558,11 @@ def download(token: str, background_tasks: BackgroundTasks):
             shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(status_code=404, detail="File missing.")
 
+    mode_key = _mode_key_or_default(data.get("mode"))
+    mode_suffix = "departure_duty" if mode_key == "departure" else "monthly_roster"
     return FileResponse(
         path=str(out_path),
-        filename="roster_output.xlsx",
+        filename=f"{mode_suffix}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -351,9 +605,15 @@ def preview(token: str, request: Request):
     if not isinstance(out_path, Path) or not out_path.exists():
         raise HTTPException(status_code=404, detail="File missing.")
 
+    mode_key = _mode_key_or_default(data.get("mode"))
+    mode_label = _SCHEDULE_MODES.get(mode_key, _SCHEDULE_MODES["monthly"])["label"]
+
     try:
         wb = load_workbook(out_path, data_only=True)
-        ws = wb.active
+        if mode_key == "departure" and "Dispatch" in wb.sheetnames:
+            ws = wb["Dispatch"]
+        else:
+            ws = wb.active
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read Excel: {e}")
 
@@ -361,18 +621,20 @@ def preview(token: str, request: Request):
     shift_charts = chart_data.get("shift", {}) or {}
     skill_charts = chart_data.get("skill", {}) or {}
     pull_charts = chart_data.get("pull", {}) or {}
+    dep_charts = chart_data.get("departure", {}) or {}
 
     max_rows = ws.max_row
     max_cols = ws.max_column
 
     col_pct = 100 / max(1, max_cols)
+    min_col_width = "96px" if mode_key == "departure" else "110px"
     # Build HTML table with basic fill colors + bold
     rows_html = []
     for r in range(1, max_rows + 1):
         cells = []
         for c in range(1, max_cols + 1):
             cell = ws.cell(row=r, column=c)
-            val = _esc("" if cell.value is None else str(cell.value))
+            val = _esc("" if cell.value is None else str(cell.value)).replace("\n", "<br/>")
             styles = []
             fill = cell.fill
             if fill and getattr(fill, "fill_type", None) not in (None, "none"):
@@ -384,7 +646,8 @@ def preview(token: str, request: Request):
             if cell.font and cell.font.bold:
                 styles.append("font-weight: 700;")
             styles.append(f"width:{col_pct:.3f}%")
-            styles.append("min-width:110px")
+            styles.append(f"min-width:{min_col_width}")
+            styles.append("vertical-align:top")
             style_attr = f' style="{" ".join(styles)}"'
             tag = "th" if r == 1 else "td"
             cells.append(f"<{tag}{style_attr}>{val}</{tag}>")
@@ -396,9 +659,7 @@ def preview(token: str, request: Request):
         + "</table>"
     )
 
-    # Build charts HTML
-    charts_html = ""
-    for sh, groups in shift_charts.items():
+    def _render_dual_group_card(title: str, groups: dict) -> str:
         a_list = groups.get("A", []) or []
         b_list = groups.get("B", []) or []
         max_val = 0
@@ -409,141 +670,120 @@ def preview(token: str, request: Request):
                 pass
         max_val = max(1, max_val)
 
-        def _bars(items, color):
+        def _bars(items: list, tone_class: str) -> str:
             rows = []
             for name, v in items:
                 try:
                     val = int(v)
                 except Exception:
                     val = 0
-                width = int((val / max_val) * 200)
+                width_pct = int((val / max_val) * 100)
                 safe_name = _esc(name)
                 rows.append(
-                    f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
-                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{safe_name}</div>"
-                    f"<div style='height:12px;width:{width}px;background:{color};'></div>"
-                    f"<div style='width:24px;text-align:right;'>{val}</div>"
-                    f"</div>"
+                    "<div class='viz-row'>"
+                    f"<div class='viz-name'>{safe_name}</div>"
+                    "<div class='viz-bar-track'>"
+                    f"<div class='viz-bar {tone_class}' style='width:{width_pct}%;'></div>"
+                    "</div>"
+                    f"<div class='viz-value'>{val}</div>"
+                    "</div>"
                 )
-            return "".join(rows) if rows else "<div style='color:#888;'>無資料</div>"
+            return "".join(rows) if rows else "<div class='viz-empty'>無資料</div>"
 
-        charts_html += (
-            f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;'>"
-            f"<div style='font-weight:600;margin-bottom:8px;'>{_esc(sh)}</div>"
-            f"<div style='display:flex;gap:16px;'>"
-            f"<div style='flex:1;border-right:1px solid #eee;padding-right:8px;'>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>A組</div>"
-            f"{_bars(a_list, '#F9E27D')}"
-            f"</div>"
-            f"<div style='flex:1;padding-left:8px;'>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>B組</div>"
-            f"{_bars(b_list, '#9AD59A')}"
-            f"</div>"
-            f"</div>"
-            f"</div>"
+        return (
+            "<div class='viz-card'>"
+            f"<div class='viz-title'>{_esc(title)}</div>"
+            "<div class='viz-grid'>"
+            "<div class='viz-col viz-col-split'>"
+            "<div class='viz-col-title'>A組</div>"
+            f"{_bars(a_list, 'viz-tone-a')}"
+            "</div>"
+            "<div class='viz-col'>"
+            "<div class='viz-col-title'>B組</div>"
+            f"{_bars(b_list, 'viz-tone-b')}"
+            "</div>"
+            "</div>"
+            "</div>"
         )
 
-    skill_html = ""
-    for sk, groups in skill_charts.items():
-        a_list = groups.get("A", []) or []
-        b_list = groups.get("B", []) or []
-        max_val = 0
-        for _, v in a_list + b_list:
+    charts_html = "".join(_render_dual_group_card(sh, groups) for sh, groups in shift_charts.items())
+    skill_html = "".join(_render_dual_group_card(sk, groups) for sk, groups in skill_charts.items())
+    pull_html = "".join(_render_dual_group_card(title, groups) for title, groups in pull_charts.items())
+
+    def _fmt_hour_val(v) -> str:
+        try:
+            f = float(v)
+        except Exception:
+            return "0.0"
+        if abs(f - round(f)) < 1e-9:
+            return f"{int(round(f))}.0"
+        return f"{f:.1f}"
+
+    def _render_early_late_card(title: str, groups: dict) -> str:
+        early_list = groups.get("Early", []) or []
+        late_list = groups.get("Late", []) or []
+        max_val = 0.0
+        for _, v in early_list + late_list:
             try:
-                max_val = max(max_val, int(v))
+                max_val = max(max_val, float(v))
             except Exception:
                 pass
-        max_val = max(1, max_val)
+        max_val = max(0.1, max_val)
 
-        def _bars(items, color):
+        def _bars(items: list, tone_class: str) -> str:
             rows = []
             for name, v in items:
                 try:
-                    val = int(v)
+                    val = float(v)
                 except Exception:
-                    val = 0
-                width = int((val / max_val) * 200)
+                    val = 0.0
+                width_pct = int((val / max_val) * 100)
                 safe_name = _esc(name)
                 rows.append(
-                    f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
-                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{safe_name}</div>"
-                    f"<div style='height:12px;width:{width}px;background:{color};'></div>"
-                    f"<div style='width:24px;text-align:right;'>{val}</div>"
-                    f"</div>"
+                    "<div class='viz-row'>"
+                    f"<div class='viz-name'>{safe_name}</div>"
+                    "<div class='viz-bar-track'>"
+                    f"<div class='viz-bar {tone_class}' style='width:{width_pct}%;'></div>"
+                    "</div>"
+                    f"<div class='viz-value'>{_fmt_hour_val(val)}h</div>"
+                    "</div>"
                 )
-            return "".join(rows) if rows else "<div style='color:#888;'>無資料</div>"
+            return "".join(rows) if rows else "<div class='viz-empty'>無資料</div>"
 
-        skill_html += (
-            f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;'>"
-            f"<div style='font-weight:600;margin-bottom:8px;'>{_esc(sk)}</div>"
-            f"<div style='display:flex;gap:16px;'>"
-            f"<div style='flex:1;border-right:1px solid #eee;padding-right:8px;'>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>A組</div>"
-            f"{_bars(a_list, '#F9E27D')}"
-            f"</div>"
-            f"<div style='flex:1;padding-left:8px;'>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>B組</div>"
-            f"{_bars(b_list, '#9AD59A')}"
-            f"</div>"
-            f"</div>"
-            f"</div>"
+        return (
+            "<div class='viz-card'>"
+            f"<div class='viz-title'>{_esc(title)}</div>"
+            "<div class='viz-grid'>"
+            "<div class='viz-col viz-col-split'>"
+            "<div class='viz-col-title'>早班（05/06）</div>"
+            f"{_bars(early_list, 'viz-tone-a')}"
+            "</div>"
+            "<div class='viz-col'>"
+            "<div class='viz-col-title'>晚班（07/08）</div>"
+            f"{_bars(late_list, 'viz-tone-b')}"
+            "</div>"
+            "</div>"
+            "</div>"
         )
 
-    pull_html = ""
-    for title, groups in pull_charts.items():
-        a_list = groups.get("A", []) or []
-        b_list = groups.get("B", []) or []
-        max_val = 0
-        for _, v in a_list + b_list:
-            try:
-                max_val = max(max_val, int(v))
-            except Exception:
-                pass
-        max_val = max(1, max_val)
-
-        def _bars(items, color):
-            rows = []
-            for name, v in items:
-                try:
-                    val = int(v)
-                except Exception:
-                    val = 0
-                width = int((val / max_val) * 200)
-                safe_name = _esc(name)
-                rows.append(
-                    f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
-                    f"<div style='width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{safe_name}</div>"
-                    f"<div style='height:12px;width:{width}px;background:{color};'></div>"
-                    f"<div style='width:24px;text-align:right;'>{val}</div>"
-                    f"</div>"
-                )
-            return "".join(rows) if rows else "<div style='color:#888;'>無資料</div>"
-
-        pull_html += (
-            f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;'>"
-            f"<div style='font-weight:600;margin-bottom:8px;'>{_esc(title)}</div>"
-            f"<div style='display:flex;gap:16px;'>"
-            f"<div style='flex:1;border-right:1px solid #eee;padding-right:8px;'>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>A組</div>"
-            f"{_bars(a_list, '#F9E27D')}"
-            f"</div>"
-            f"<div style='flex:1;padding-left:8px;'>"
-            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>B組</div>"
-            f"{_bars(b_list, '#9AD59A')}"
-            f"</div>"
-            f"</div>"
-            f"</div>"
-        )
+    departure_work_html = ""
+    departure_auto_html = ""
+    if dep_charts:
+        departure_work_html = _render_early_late_card("總上勤時數（小時）", dep_charts.get("work", {}) or {})
+        departure_auto_html = _render_early_late_card("自動通關時數（小時）", dep_charts.get("auto", {}) or {})
 
     return templates.TemplateResponse(
         "preview.html",
         {
             "request": request,
             "token": token,
+            "mode_label": mode_label,
             "table_html": table_html,
             "charts_html": charts_html,
             "skill_html": skill_html,
             "pull_html": pull_html,
+            "departure_work_html": departure_work_html,
+            "departure_auto_html": departure_auto_html,
         },
     )
 
@@ -558,6 +798,7 @@ def report_pdf(token: str):
     shift_charts = chart_data.get("shift", {}) or {}
     skill_charts = chart_data.get("skill", {}) or {}
     pull_charts = chart_data.get("pull", {}) or {}
+    dep_charts = chart_data.get("departure", {}) or {}
 
     # Register Chinese font
     font_path = BASE_DIR / "fonts" / "static" / "NotoSansTC-Regular.ttf"
@@ -571,17 +812,17 @@ def report_pdf(token: str):
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
 
-    def _draw_chart(title: str, groups: dict, y: float) -> float:
+    def _draw_chart(title: str, groups: dict, y: float, left_label: str = "A", right_label: str = "B") -> float:
         c.setFont(base_font, 10)
         c.drawString(20 * mm, y, title)
         y -= 6 * mm
 
         a_list = groups.get("A", []) or []
         b_list = groups.get("B", []) or []
-        max_val = 1
+        max_val = 1.0
         for _, v in a_list + b_list:
             try:
-                max_val = max(max_val, int(v))
+                max_val = max(max_val, float(v))
             except Exception:
                 pass
 
@@ -591,15 +832,19 @@ def report_pdf(token: str):
             y1 = y0 - 4 * mm
             for name, v in items:
                 try:
-                    val = int(v)
+                    val = float(v)
                 except Exception:
-                    val = 0
+                    val = 0.0
                 bar_w = 60 * mm * (val / max_val)
                 c.setFillColor(HexColor(color))
                 c.rect(x0 + 22 * mm, y1 - 2, bar_w, 3 * mm, stroke=0, fill=1)
                 c.setFillColor(HexColor("#000000"))
                 c.drawString(x0, y1, str(name)[:10])
-                c.drawRightString(x0 + 20 * mm, y1, f"{val}")
+                if abs(val - round(val)) < 1e-9:
+                    val_text = f"{int(round(val))}"
+                else:
+                    val_text = f"{val:.1f}"
+                c.drawRightString(x0 + 20 * mm, y1, val_text)
                 y1 -= 4 * mm
                 if y1 < 20 * mm:
                     c.showPage()
@@ -608,8 +853,8 @@ def report_pdf(token: str):
 
         left_x = 20 * mm
         right_x = width / 2 + 5 * mm
-        y_left = _draw_group("A", a_list, "#F9E27D", left_x, y)
-        y_right = _draw_group("B", b_list, "#9AD59A", right_x, y)
+        y_left = _draw_group(left_label, a_list, "#F9E27D", left_x, y)
+        y_right = _draw_group(right_label, b_list, "#9AD59A", right_x, y)
         y = min(y_left, y_right) - 8 * mm
         if y < 25 * mm:
             c.showPage()
@@ -623,6 +868,17 @@ def report_pdf(token: str):
         y = _draw_chart(title, groups, y)
     for title, groups in pull_charts.items():
         y = _draw_chart(title, groups, y)
+    if dep_charts:
+        work_groups = {
+            "A": (dep_charts.get("work", {}) or {}).get("Early", []) or [],
+            "B": (dep_charts.get("work", {}) or {}).get("Late", []) or [],
+        }
+        auto_groups = {
+            "A": (dep_charts.get("auto", {}) or {}).get("Early", []) or [],
+            "B": (dep_charts.get("auto", {}) or {}).get("Late", []) or [],
+        }
+        y = _draw_chart("總上勤時數（小時）", work_groups, y, left_label="早班", right_label="晚班")
+        y = _draw_chart("自動通關時數（小時）", auto_groups, y, left_label="早班", right_label="晚班")
 
     c.save()
     buf.seek(0)
