@@ -65,29 +65,49 @@ def _mode_key_or_default(mode: str | None) -> str:
 def _get_scheduler_funcs():
     import 機場排班程式 as monthly_mod  # noqa: E402
     departure_mod = None
+    departure_api = "none"  # none | new | legacy
     departure_import_error: Exception | None = None
     try:
         importlib.invalidate_caches()
         departure_mod = importlib.import_module("departure_duty_scheduler")
+        departure_api = "new"
     except Exception as e:
         departure_import_error = e
+        try:
+            departure_mod = importlib.import_module("departure_scheduler")
+            departure_api = "legacy"
+        except Exception:
+            pass
 
     run_monthly = getattr(monthly_mod, "run_scheduler")
     validate_monthly = getattr(monthly_mod, "validate_input_excel")
 
     def validate_departure(input_excel_path: str) -> list[dict]:
-        if departure_import_error is not None:
+        if departure_api == "none":
+            reason = (
+                "departure scheduler module not found on server. "
+                "請確認已部署 `departure_duty_scheduler.py`（或舊版 `departure_scheduler.py`）。"
+            )
+            if departure_import_error is not None:
+                reason = f"{reason} 原始錯誤: {departure_import_error}"
             return [
                 {
                     "sheet": "Departure",
                     "columns": [],
-                    "reason": f"departure_duty_scheduler import failed: {departure_import_error}",
+                    "reason": reason,
                 }
             ]
         try:
             assert departure_mod is not None
-            emp_df, dem_df = departure_mod.read_input(input_excel_path)
-            departure_mod.validate_input(emp_df, dem_df)
+            if departure_api == "new":
+                emp_df, dem_df = departure_mod.read_input(input_excel_path)
+                departure_mod.validate_input(emp_df, dem_df)
+            else:
+                # Legacy departure wrapper (monthly-engine based)
+                validate_fn = getattr(departure_mod, "validate_departure_input_excel", None)
+                if callable(validate_fn):
+                    return validate_fn(input_excel_path) or []
+                raise RuntimeError("legacy departure module 缺少 validate_departure_input_excel")
             return []
         except Exception as e:
             return [{"sheet": "Departure", "columns": [], "reason": str(e)}]
@@ -99,14 +119,43 @@ def _get_scheduler_funcs():
         progress_callback=None,
         **kwargs,
     ) -> dict:
-        if departure_import_error is not None:
-            raise RuntimeError(f"departure_duty_scheduler import failed: {departure_import_error}")
+        if departure_api == "none":
+            raise RuntimeError(
+                "departure scheduler module missing. "
+                "請部署 `departure_duty_scheduler.py`（或舊版 `departure_scheduler.py`）。"
+            )
         assert departure_mod is not None
         out_path = str(output_excel_path or "")
         if out_path.strip() == "":
             raise ValueError("output_excel_path is required for departure mode.")
 
         report_path = str(Path(out_path).with_name("departure_report.txt"))
+        if departure_api == "legacy":
+            run_fn = getattr(departure_mod, "run_departure_scheduler", None)
+            if not callable(run_fn):
+                raise RuntimeError("legacy departure module 缺少 run_departure_scheduler")
+            result = run_fn(
+                input_excel_path=input_excel_path,
+                output_excel_path=out_path,
+                search_best_roster=True,
+                search_patience=5,
+                require_all_pulls_nonzero=False,
+                rescue_fill=True,
+                debug=False,
+                progress_callback=progress_callback,
+                priority_mode=str(kwargs.get("priority_mode", "team1")),
+                custom_order=str(kwargs.get("custom_order", "fairness,shift_count")),
+                score_order=str(kwargs.get("score_order", "fairness,shift,pull")),
+            )
+            return {
+                "tries": int(result.get("tries", 1) or 1),
+                "best_score_100": float(result.get("best_score_100", 0.0) or 0.0),
+                "chart_data": result.get("chart_data", {}) or {},
+                "mode_used": str(result.get("mode_used", "legacy")),
+                "status": str(result.get("status", "legacy_ok")),
+                "total_shortage_slots": int(result.get("total_shortage_slots", 0) or 0),
+            }
+
         settings = departure_mod.SolverSettings(
             weight_last_hour_work=50,
             weight_group_fairness=8,
