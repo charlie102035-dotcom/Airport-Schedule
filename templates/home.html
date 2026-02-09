@@ -292,8 +292,10 @@
         const active = teamOptions.find((opt) => opt.classList.contains('is-active'));
         if (!active) return;
         const x = active.offsetLeft;
+        const y = active.offsetTop;
         teamSelectorMask.style.width = `${active.offsetWidth}px`;
-        teamSelectorMask.style.transform = `translateX(${x}px)`;
+        teamSelectorMask.style.height = `${active.offsetHeight}px`;
+        teamSelectorMask.style.transform = `translate(${x}px, ${y}px)`;
       }
 
       function syncTeamSelection() {
