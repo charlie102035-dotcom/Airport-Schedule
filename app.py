@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 from pathlib import Path
@@ -59,6 +60,44 @@ _SCHEDULE_MODES: dict[str, dict] = {
 def _mode_key_or_default(mode: str | None) -> str:
     key = str(mode or "").strip().lower()
     return key if key in _SCHEDULE_MODES else "monthly"
+
+
+def _build_departure_settings(departure_mod):
+    return departure_mod.SolverSettings(
+        weight_last_hour_work=50,
+        weight_group_fairness=14,
+        weight_target_deviation=3,
+        weight_same_hour_consistency=28,
+        weight_single_slot_fragment=34,
+        weight_early_late_equal_soft=600,
+        weight_dedicated_assignment_bonus=28,
+        weight_dedicated_miss_when_available=85,
+        weight_single_dedicated_miss=140,
+        weight_dedicated_frontload=8,
+        weight_non_dedicated_when_ded_available=36,
+        weight_dedicated_assignment_bonus_public=54,
+        weight_dedicated_miss_when_available_public=170,
+        weight_single_dedicated_miss_public=260,
+        weight_dedicated_frontload_public=18,
+        weight_non_dedicated_when_ded_available_public=120,
+        dedicated_frontload_slots=4,
+        weight_auto_gate_balance=78,
+        weight_consecutive_2p5h=10,
+        weight_consecutive_3h=26,
+        weight_shortage_slot=100000,
+        auto_gate_max_slots=6,
+        max_consecutive_work_slots=6,
+        early_max_consecutive_work_slots=5,
+        early_max_work_slots=14,
+        late_max_work_slots=15,
+        enforce_early_late_equal_hours=False,
+        enforce_late_longer_than_early=False,
+        min_late_minus_early_slots=1,
+        enforce_shift_work_caps=True,
+        weight_shift_cap_excess=30,
+        feasibility_mode="hard",
+        max_time_sec=30,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -168,22 +207,7 @@ def _get_scheduler_funcs():
             except Exception:
                 pass
 
-        settings = departure_mod.SolverSettings(
-            weight_last_hour_work=50,
-            weight_group_fairness=8,
-            weight_target_deviation=3,
-            weight_same_hour_consistency=12,
-            weight_single_slot_fragment=18,
-            weight_shortage_slot=100000,
-            auto_gate_max_slots=6,
-            max_consecutive_work_slots=6,
-            early_max_work_slots=14,
-            late_max_work_slots=15,
-            enforce_shift_work_caps=False,
-            weight_shift_cap_excess=30,
-            feasibility_mode="hard",
-            max_time_sec=30,
-        )
+        settings = _build_departure_settings(departure_mod)
 
         heartbeat_thread = None
         heartbeat_stop = threading.Event()
@@ -215,7 +239,7 @@ def _get_scheduler_funcs():
                 report_path=report_path,
                 settings=settings,
                 dry_run=False,
-                fallback_to_allow_shortage=False,
+                fallback_to_allow_shortage=True,
             )
         finally:
             if heartbeat_thread is not None:
@@ -275,10 +299,12 @@ def _store_result(
     best_score_100: float,
     chart_data: dict,
     mode: str,
+    input_path: Path | None = None,
 ) -> None:
     _RESULTS[token] = {
         "out_path": out_path,
         "tmpdir": tmpdir,
+        "input_path": input_path,
         "tries": tries,
         "best_score_100": best_score_100,
         "chart_data": chart_data,
@@ -450,6 +476,71 @@ def _build_departure_chart_data(output_excel_path: str) -> dict:
     return {"work": work, "auto": auto}
 
 
+def _hm_to_min(label: str) -> int:
+    s = str(label).strip()
+    ts = pd.to_datetime(s, format="%H:%M", errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"時間格式錯誤: {label} (需 HH:MM)")
+    return int(ts.hour) * 60 + int(ts.minute)
+
+
+def build_dfs_from_config(config: dict):
+    """JSON config → (emp_df, dem_df) matching departure_duty_scheduler.read_input() schema"""
+    roles = config.get("roles", [])
+    employees = config.get("employees", [])
+    demand = config.get("demand", {})
+
+    if not roles:
+        raise ValueError("至少需要一個崗位")
+    if not employees:
+        raise ValueError("至少需要一名人員")
+
+    role_ids = [r["id"] for r in roles]
+
+    # emp_df: columns = name, shift_start, shift_end, skill_<role_id>...
+    emp_rows = []
+    for emp in employees:
+        name = str(emp.get("name", "")).strip()
+        if not name:
+            raise ValueError("人員姓名不可為空")
+        row = {
+            "name": name,
+            "shift_start": str(emp.get("shift_start", "")),
+            "shift_end": str(emp.get("shift_end", "")),
+        }
+        skills = emp.get("skills", {})
+        if not any(int(v) > 0 for v in skills.values() if str(v).isdigit()):
+            raise ValueError(f"人員「{name}」至少需要一項技能（>0）")
+        for rid in role_ids:
+            row[f"skill_{rid}"] = int(skills.get(rid, 0))
+        emp_rows.append(row)
+    emp_df = pd.DataFrame(emp_rows)
+
+    # dem_df: columns = time, <role_id>... (all 30 slots 05:00~19:30)
+    slots = []
+    cur = 5 * 60
+    while cur <= 19 * 60 + 30:
+        slots.append(f"{cur // 60:02d}:{cur % 60:02d}")
+        cur += 30
+    dem_rows = []
+    for slot in slots:
+        row = {"time": slot}
+        slot_demand = demand.get(slot, {})
+        for rid in role_ids:
+            try:
+                row[rid] = max(0, int(slot_demand.get(rid, 0)))
+            except (ValueError, TypeError):
+                row[rid] = 0
+        dem_rows.append(row)
+    dem_df = pd.DataFrame(dem_rows)
+    return emp_df, dem_df
+
+
+def _load_departure_module():
+    importlib.invalidate_caches()
+    return importlib.import_module("departure_duty_scheduler")
+
+
 def _cleanup_expired_results() -> None:
     now = time.time()
     expired = [k for k, v in _RESULTS.items() if now - float(v.get("ts", 0)) > _RESULT_TTL_SEC]
@@ -521,6 +612,138 @@ def monthly_home(request: Request):
     return _render_scheduler_home(request, default_mode="monthly")
 
 
+@app.get("/departure/preset/{squad}")
+def departure_preset(squad: str):
+    import json as _json
+    valid = {"squad1", "squad2", "squad3"}
+    if squad not in valid:
+        raise HTTPException(status_code=404, detail="squad not found")
+    preset_path = BASE_DIR / "static" / f"{squad}_preset.json"
+    if not preset_path.exists():
+        raise HTTPException(status_code=404, detail="preset not found")
+    with preset_path.open(encoding="utf-8") as f:
+        data = _json.load(f)
+    return JSONResponse(content=data)
+
+
+@app.get("/departure/config", response_class=HTMLResponse)
+def departure_config(request: Request, squad: str = "squad1"):
+    import json
+    valid = {"squad1", "squad2", "squad3"}
+    if squad not in valid:
+        squad = "squad1"
+    squad_labels = {"squad1": "一分隊", "squad2": "二分隊", "squad3": "三分隊"}
+    default_roles = [
+        {"id": "公務台",  "label": "公務檯"},
+        {"id": "公協",    "label": "公務檯協勤引導"},
+        {"id": "查驗台1", "label": "1號檯"},
+        {"id": "查驗台3", "label": "3號檯"},
+        {"id": "查驗台4", "label": "4號檯"},
+        {"id": "自動通關", "label": "自動通關"},
+        {"id": "發證",    "label": "補出櫃檯"},
+    ]
+    slots = []
+    cur = 5 * 60
+    while cur <= 19 * 60 + 30:
+        slots.append(f"{cur // 60:02d}:{cur % 60:02d}")
+        cur += 30
+    resp = templates.TemplateResponse("departure_config.html", {
+        "request": request,
+        "squad": squad,
+        "squad_label": squad_labels[squad],
+        "squad_labels_json": json.dumps(squad_labels),
+        "default_roles_json": json.dumps(default_roles),
+        "time_slots_json": json.dumps(slots),
+        "special_roles_json": json.dumps(["自動通關", "公務台"]),
+    })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.post("/run-from-config")
+async def run_from_config(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    config_json: str = Form(...),
+):
+    import json as _json
+    try:
+        config = _json.loads(config_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="config_json 格式錯誤")
+
+    # Build & validate DataFrames
+    try:
+        emp_df, dem_df = build_dfs_from_config(config)
+    except ValueError as e:
+        return templates.TemplateResponse(
+            "validation_error.html",
+            {"request": request, "message": str(e)},
+            status_code=400,
+        )
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="airport_cfg_"))
+    in_path = tmpdir / "input.xlsx"
+    out_path = tmpdir / "output.xlsx"
+    mode_key = "departure"
+    mode_cfg = _SCHEDULE_MODES["departure"]
+
+    try:
+        _cleanup_expired_results()
+        with pd.ExcelWriter(in_path, engine="openpyxl") as writer:
+            emp_df.to_excel(writer, sheet_name="Employees", index=False)
+            dem_df.to_excel(writer, sheet_name="Demand", index=False)
+
+        scheduler_funcs = _get_scheduler_funcs()
+        mode_funcs = scheduler_funcs["departure"]
+        validate_fn = mode_funcs["validate"]
+        validation_errors = validate_fn(str(in_path))
+        if validation_errors:
+            msg = _format_validation_errors(validation_errors)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return templates.TemplateResponse(
+                "validation_error.html",
+                {"request": request, "message": msg},
+                status_code=400,
+            )
+
+        token = uuid.uuid4().hex
+        _init_progress(token, tmpdir, 100, mode_key)
+        run_scheduler = mode_funcs["run"]
+
+        async def _run_job() -> None:
+            try:
+                def _cb(cur: int, mx: int, phase: str | None = None):
+                    _set_progress(token, cur, mx, phase)
+
+                def _blocking() -> dict:
+                    return run_scheduler(
+                        input_excel_path=str(in_path),
+                        output_excel_path=str(out_path),
+                        debug=False,
+                        progress_callback=_cb,
+                    )
+                result = await asyncio.to_thread(_blocking)
+                _store_result(token, out_path, tmpdir,
+                              int(result.get("tries", 0) or 0),
+                              float(result.get("best_score_100", 0.0) or 0.0),
+                              result.get("chart_data", {}) or {},
+                              mode_key, input_path=in_path)
+            except Exception as e:
+                _set_error(token, str(e))
+
+        background_tasks.add_task(_run_job)
+        return templates.TemplateResponse("running.html", {
+            "request": request,
+            "token": token,
+            "mode_label": mode_cfg["label"],
+            "mode_key": mode_key,
+        })
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+
 @app.post("/run")
 async def run(
     background_tasks: BackgroundTasks,
@@ -576,27 +799,31 @@ async def run(
         token = uuid.uuid4().hex
         _init_progress(token, tmpdir, 100, mode_key)
 
-        def _run_job() -> None:
+        async def _run_job() -> None:
             try:
                 def _cb(cur: int, mx: int, phase: str | None = None) -> None:
                     _set_progress(token, cur, mx, phase)
 
                 run_kwargs = mode_cfg.get("run_kwargs", {}) or {}
-                result = run_scheduler(
-                    input_excel_path=str(in_path),
-                    output_excel_path=str(out_path),
-                    debug=False,
-                    progress_callback=_cb,
-                    priority_mode=priority_mode,
-                    custom_order=custom_order,
-                    score_order=score_order,
-                    **run_kwargs,
-                )
+
+                def _blocking() -> dict:
+                    return run_scheduler(
+                        input_excel_path=str(in_path),
+                        output_excel_path=str(out_path),
+                        debug=False,
+                        progress_callback=_cb,
+                        priority_mode=priority_mode,
+                        custom_order=custom_order,
+                        score_order=score_order,
+                        **run_kwargs,
+                    )
+
+                result = await asyncio.to_thread(_blocking)
 
                 tries_used = int(result.get("tries", 0) or 0)
                 best_score = float(result.get("best_score_100", 0.0) or 0.0)
                 chart_data = result.get("chart_data", {}) or {}
-                _store_result(token, out_path, tmpdir, tries_used, best_score, chart_data, mode_key)
+                _store_result(token, out_path, tmpdir, tries_used, best_score, chart_data, mode_key, input_path=in_path)
             except Exception as e:
                 _set_error(token, str(e))
 
@@ -853,6 +1080,7 @@ def preview(token: str, request: Request):
         {
             "request": request,
             "token": token,
+            "mode_key": mode_key,
             "mode_label": mode_label,
             "table_html": table_html,
             "charts_html": charts_html,
@@ -861,6 +1089,218 @@ def preview(token: str, request: Request):
             "departure_work_html": departure_work_html,
             "departure_auto_html": departure_auto_html,
         },
+    )
+
+
+@app.get("/departure/assignment/{token}")
+def departure_assignment(token: str):
+    data = _get_result(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="Result expired or not found.")
+    if _mode_key_or_default(data.get("mode")) != "departure":
+        raise HTTPException(status_code=400, detail="This endpoint is only for departure mode.")
+
+    out_path = data.get("out_path")
+    if not isinstance(out_path, Path) or not out_path.exists():
+        raise HTTPException(status_code=404, detail="Output file missing.")
+
+    try:
+        df = pd.read_excel(out_path, sheet_name="Assignment")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read assignment sheet: {e}")
+
+    time_cols = [c for c in df.columns if isinstance(c, str) and ":" in c]
+    rows = []
+    for _, row in df.iterrows():
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        rec = {"name": name, "shift_window": str(row.get("shift_window", "")).strip(), "slots": {}}
+        for tl in time_cols:
+            val = row.get(tl, "")
+            rec["slots"][tl] = "" if pd.isna(val) else str(val)
+        rows.append(rec)
+
+    return JSONResponse(
+        {
+            "token": token,
+            "time_labels": time_cols,
+            "rows": rows,
+        }
+    )
+
+
+@app.post("/departure/reoptimize/{token}")
+async def departure_reoptimize(token: str, request: Request):
+    data = _get_result(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="Result expired or not found.")
+    if _mode_key_or_default(data.get("mode")) != "departure":
+        raise HTTPException(status_code=400, detail="This endpoint is only for departure mode.")
+
+    tmpdir = data.get("tmpdir")
+    out_path = data.get("out_path")
+    if not isinstance(tmpdir, Path):
+        raise HTTPException(status_code=400, detail="Temporary directory missing.")
+    if not isinstance(out_path, Path) or not out_path.exists():
+        raise HTTPException(status_code=404, detail="Current output file missing.")
+
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object.")
+
+    freeze_outside = bool(payload.get("freeze_outside_window", False))
+    window_start = str(payload.get("window_start", "") or "").strip()
+    window_end = str(payload.get("window_end", "") or "").strip()
+    locks = payload.get("locks", []) or []
+    if not isinstance(locks, list):
+        raise HTTPException(status_code=400, detail="`locks` must be a list.")
+
+    if freeze_outside and (not window_start or not window_end):
+        raise HTTPException(status_code=400, detail="freeze_outside_window=true requires window_start and window_end.")
+
+    try:
+        ws_min = _hm_to_min(window_start) if window_start else None
+        we_min = _hm_to_min(window_end) if window_end else None
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if ws_min is not None and we_min is not None and we_min <= ws_min:
+        raise HTTPException(status_code=400, detail="window_end must be later than window_start.")
+
+    input_path = data.get("input_path")
+    if not isinstance(input_path, Path) or not input_path.exists():
+        input_path = tmpdir / "input.xlsx"
+    if not input_path.exists():
+        raise HTTPException(status_code=404, detail="Input file missing for re-optimize.")
+
+    try:
+        dep_mod = _load_departure_module()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"departure_duty_scheduler import failed: {e}")
+
+    try:
+        emp_df, dem_df = dep_mod.read_input(str(input_path))
+        dep_mod.validate_input(emp_df, dem_df)
+        prob = dep_mod.build_problem_data(emp_df, dem_df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load departure input: {e}")
+
+    try:
+        assignment_df = pd.read_excel(out_path, sheet_name="Assignment")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read existing Assignment sheet: {e}")
+
+    row_by_name = {}
+    for _, row in assignment_df.iterrows():
+        nm = str(row.get("name", "")).strip()
+        if nm:
+            row_by_name[nm] = row
+
+    eidx = {e.name: i for i, e in enumerate(prob.employees)}
+    tidx = {tl: i for i, tl in enumerate(prob.time_labels)}
+    locked_roles: dict[tuple[int, int], str] = {}
+    locked_work: dict[tuple[int, int], int] = {}
+
+    def _in_window_label(tl: str) -> bool:
+        if ws_min is None or we_min is None:
+            return True
+        tm = _hm_to_min(tl)
+        return ws_min <= tm < we_min
+
+    if freeze_outside:
+        for emp in prob.employees:
+            row = row_by_name.get(emp.name)
+            if row is None:
+                continue
+            ei = eidx[emp.name]
+            for tl in prob.time_labels:
+                if _in_window_label(tl):
+                    continue
+                ti = tidx[tl]
+                val = row.get(tl, "")
+                txt = "" if pd.isna(val) else str(val).strip()
+                if txt in prob.roles:
+                    locked_roles[(ei, ti)] = txt
+                    locked_work[(ei, ti)] = 1
+                elif txt in {"BREAK", "OFF", ""}:
+                    locked_work[(ei, ti)] = 0
+
+    role_normalizer = getattr(dep_mod, "_canon_role", None)
+    for i, item in enumerate(locks):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"locks[{i}] must be an object.")
+        name = str(item.get("name", "")).strip()
+        tl = str(item.get("time", "")).strip()
+        role_raw = str(item.get("role", "")).strip()
+        if not name or not tl:
+            raise HTTPException(status_code=400, detail=f"locks[{i}] requires name and time.")
+        if name not in eidx:
+            raise HTTPException(status_code=400, detail=f"locks[{i}] unknown employee: {name}")
+        if tl not in tidx:
+            raise HTTPException(status_code=400, detail=f"locks[{i}] unknown time label: {tl}")
+        role = role_normalizer(role_raw) if callable(role_normalizer) else role_raw
+        ei = eidx[name]
+        ti = tidx[tl]
+        if role in {"", "BREAK", "OFF", "休", "休息"}:
+            locked_work[(ei, ti)] = 0
+            locked_roles.pop((ei, ti), None)
+            continue
+        if role not in prob.roles:
+            raise HTTPException(status_code=400, detail=f"locks[{i}] unknown role: {role_raw}")
+        locked_roles[(ei, ti)] = role
+        locked_work[(ei, ti)] = 1
+
+    new_token = uuid.uuid4().hex
+    new_out = tmpdir / f"output_reopt_{new_token[:8]}.xlsx"
+    new_report = tmpdir / f"departure_report_reopt_{new_token[:8]}.txt"
+    settings = _build_departure_settings(dep_mod)
+
+    try:
+        result = dep_mod.run_pipeline(
+            input_path=str(input_path),
+            output_excel_path=str(new_out),
+            report_path=str(new_report),
+            settings=settings,
+            dry_run=False,
+            fallback_to_allow_shortage=True,
+            locked_role_assignments=locked_roles,
+            locked_work_state=locked_work,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Re-optimize failed: {e}")
+
+    all_covered = bool(result.get("all_covered", False))
+    total_shortage = int(result.get("total_shortage_slots", 0) or 0)
+    if not all_covered:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Re-optimized schedule still has shortage. "
+                f"status={result.get('status', '')}, shortage_slots={total_shortage}, "
+                f"report={result.get('report', str(new_report))}"
+            ),
+        )
+
+    dep_stats = _build_departure_chart_data(str(new_out))
+    _store_result(
+        new_token,
+        new_out,
+        tmpdir,
+        tries=1,
+        best_score_100=100.0,
+        chart_data={"departure": dep_stats},
+        mode="departure",
+        input_path=input_path,
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "token": new_token,
+            "preview_url": f"/preview/{new_token}",
+            "download_url": f"/download/{new_token}",
+            "report_url": f"/report/{new_token}",
+            "locks_applied": len(locked_roles) + len([1 for _, v in locked_work.items() if v == 0]),
+        }
     )
 
 
